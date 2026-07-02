@@ -7,8 +7,9 @@ import { useService } from "../platform";
 import { LayoutServiceId } from "../workbench/layout";
 import { registerList, registerTab, type TabProps } from "../contributions";
 import { Icon } from "../ui-kit";
+import { OPEN_ENTITY_EVENT } from "../canvas/actions";
 import { ContextMenu, copyText } from "../ui-kit/ContextMenu";
-import { Markdown } from "../ui-kit/Markdown";
+import { MdxDoc } from "../ui-kit/MdxDoc";
 // Data-access lives in its own SoC module (scoped to the authed user — no client subject, P20),
 // proven in isolation by workspaceApi.test.ts.
 import { readWorkspaceFile, listWorkspaceTree, readWorkspaceGit, readAttachedWorkspaces, swapWorkspace, renameWorkspace, type GitState, type AttachedWorkspaces } from "./workspaceApi";
@@ -23,7 +24,25 @@ function parseEntity(text: string): { fm: [string, string][]; body: string } {
   return { fm, body: m[2] };
 }
 function wikilinks(text: string): ReactNode[] {
-  return text.split(/(\[\[[^\]]+\]\])/).map((part, i) => part.startsWith("[[") ? <span key={i} style={{ color: "var(--blue)" }}>{part}</span> : <span key={i}>{part}</span>);
+  // Frontmatter [[wikilinks]] are clickable: resolve + open via the same OPEN_ENTITY_EVENT the body uses.
+  return text.split(/(\[\[[^\]]+\]\])/).map((part, i) => part.startsWith("[[")
+    ? <span key={i} onClick={() => window.dispatchEvent(new CustomEvent(OPEN_ENTITY_EVENT, { detail: { wikilink: part.slice(2, -2) } }))}
+        style={{ color: "var(--blue)", cursor: "pointer" }}>{part}</span>
+    : <span key={i}>{part}</span>);
+}
+
+// ── reveal-in-tree: breadcrumb segments ask the Files list to expand down to a folder ──
+const REVEAL_PATH_EVENT = "vexa:terminal:reveal-path";
+/** All ancestor dir paths of `dir` (inclusive), e.g. "kg/entities/org" → [kg, kg/entities, kg/entities/org]. */
+const ancestorDirs = (dir: string): string[] => dir.split("/").filter(Boolean).map((_, i, parts) => parts.slice(0, i + 1).join("/"));
+function revealInTree(dir: string): void {
+  // Persist first so a not-yet-mounted FilesList picks it up on mount; the event covers the mounted case.
+  try {
+    const cur = JSON.parse(readSS(SS_EXPANDED) ?? "[]") as string[];
+    writeSS(SS_EXPANDED, JSON.stringify([...new Set([...(Array.isArray(cur) ? cur : []), ...ancestorDirs(dir)])]));
+  } catch { writeSS(SS_EXPANDED, JSON.stringify(ancestorDirs(dir))); }
+  if (!dir.startsWith("kg")) writeSS(SS_HIDDEN, "0");  // target hidden by the kg-only filter → reveal all
+  window.dispatchEvent(new CustomEvent(REVEAL_PATH_EVENT, { detail: { dir } }));
 }
 async function readFile(path: string): Promise<string> {
   return (await readWorkspaceFile(path)) ?? "(not found)";
@@ -116,6 +135,18 @@ function FilesList() {
     const top = new Set(nodes.filter((n) => n.isDir).map((n) => n.path));
     setExpanded(top); writeSS(SS_EXPANDED, JSON.stringify([...top]));
   }, [tree]);  // eslint-disable-line react-hooks/exhaustive-deps
+  // Breadcrumb "reveal in tree": expand every ancestor of the requested folder (and leave the
+  // kg-only filter if the target lives outside kg/). sessionStorage was already updated by the sender.
+  useEffect(() => {
+    const onReveal = (e: Event) => {
+      const dir = (e as CustomEvent<{ dir?: string }>).detail?.dir;
+      if (!dir) return;
+      if (!dir.startsWith("kg")) setKgOnly(false);
+      setExpanded((prev) => new Set([...prev, ...ancestorDirs(dir)]));
+    };
+    window.addEventListener(REVEAL_PATH_EVENT, onReveal);
+    return () => window.removeEventListener(REVEAL_PATH_EVENT, onReveal);
+  }, []);
   const toggle = (p: string) => setExpanded((prev) => {
     const next = new Set(prev); next.has(p) ? next.delete(p) : next.add(p);
     writeSS(SS_EXPANDED, JSON.stringify([...next])); return next;
@@ -309,6 +340,36 @@ function GitSection() {
 }
 
 // ── Doc TAB (center, kind "doc") ─────────────────────────────────────────────────
+/** The doc header path, clickable per segment: folder segments reveal that folder in the
+ *  Files tree; the file segment pins the (possibly preview) tab. */
+function PathBreadcrumb({ path }: { path: string }) {
+  const layout = useService(LayoutServiceId);
+  const parts = path.split("/").filter(Boolean);
+  const seg = { cursor: "pointer" } as const;
+  const hover = {
+    onMouseEnter: (e: MouseEvent<HTMLSpanElement>) => { e.currentTarget.style.color = "var(--t1)"; e.currentTarget.style.textDecoration = "underline"; },
+    onMouseLeave: (e: MouseEvent<HTMLSpanElement>) => { e.currentTarget.style.color = ""; e.currentTarget.style.textDecoration = "none"; },
+  };
+  return (
+    <div style={{ fontFamily: "var(--mono)", fontSize: 12, color: "var(--t3)", marginBottom: 12, display: "flex", flexWrap: "wrap", alignItems: "center" }}>
+      {parts.map((name, i) => {
+        const isFile = i === parts.length - 1;
+        const prefix = parts.slice(0, i + 1).join("/");
+        return (
+          <span key={prefix} style={{ display: "inline-flex", alignItems: "center" }}>
+            {i > 0 && <span style={{ padding: "0 2px", userSelect: "none" }}>/</span>}
+            <span {...hover} style={seg}
+              title={isFile ? "Pin this tab" : `Reveal ${prefix}/ in the Files tree`}
+              onClick={() => { if (isFile) { layout.openTab(docTab(path)); } else { revealInTree(prefix); layout.setActiveList("files"); } }}>
+              {name}
+            </span>
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
 function DocTab({ params }: TabProps) {
   const path = params.path as string;
   const [content, setContent] = useState<string | null>(null);
@@ -317,13 +378,13 @@ function DocTab({ params }: TabProps) {
   return (
     <div style={{ height: "100%", overflowY: "auto", background: "var(--bg)" }}>
       <div style={{ maxWidth: 760, margin: "0 auto", padding: "22px 24px" }}>
-        <div style={{ fontFamily: "var(--mono)", fontSize: 12, color: "var(--t3)", marginBottom: 12 }}>{path}</div>
+        <PathBreadcrumb path={path} />
         {fm.length > 0 && (
           <div style={{ border: "1px solid var(--line)", borderRadius: 10, background: "var(--panel)", padding: "10px 13px", marginBottom: 14, fontSize: 13 }}>
             {fm.map(([k, v]) => <div key={k} style={{ display: "flex", gap: 10 }}><span style={{ color: "var(--t3)", width: 96 }}>{k}</span><span style={{ color: "var(--t1)" }}>{wikilinks(v)}</span></div>)}
           </div>
         )}
-        <div style={{ fontSize: 14, color: "var(--t1)", lineHeight: 1.6 }}>{content === null ? "loading…" : <Markdown>{body}</Markdown>}</div>
+        <div style={{ fontSize: 14, color: "var(--t1)", lineHeight: 1.6 }}>{content === null ? "loading…" : <MdxDoc>{body}</MdxDoc>}</div>
       </div>
     </div>
   );

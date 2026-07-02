@@ -53,6 +53,24 @@ Bodies are normal markdown. `[[wikilinks]]` remain the primary cross-reference (
 consumers tolerate); use standard relative markdown links in `index.md` files and wherever a
 portable link helps.
 
+## Interface components (optional, render-rich)
+
+The terminal renders entity bodies as MDX with a **closed component registry**. You may use these
+tags in any entity body to make the doc an interface; everywhere else (git, plain editors) they
+degrade to readable markup. Unknown tags or malformed MDX fall back to plain-markdown rendering —
+never invent tag names outside this list:
+
+- `<Note>…</Note>` / `<Warning>…</Warning>` — callouts for context or risks.
+- `<Card title="…" icon="…" href="kg/…">…</Card>` inside `<CardGroup cols={2}>` — clickable
+  navigation cards; `href` to another entity doc opens it in-app. Icons: `user`, `building`,
+  `cal`, `tasks`, `file`, `folder`, `link`, `zap`, `spark`.
+- `<Steps><Step title="…">…</Step></Steps>` — numbered plans/processes.
+- `<Tabs><Tab title="…">…</Tab></Tabs>` — alternative views (e.g. Background / History).
+
+Use them where structure helps a human scanning the doc (plans → Steps, related entities →
+CardGroup, caveats → Warning); don't decorate for its own sake. `[[wikilinks]]` render as rich
+entity chips automatically — keep using them inline as the primary cross-reference.
+
 ## How to work
 
 - To record a person/company/meeting/etc., create or update its entity file under `kg/entities/`.
