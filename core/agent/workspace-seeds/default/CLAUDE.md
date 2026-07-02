@@ -55,21 +55,46 @@ portable link helps.
 
 ## Interface components (optional, render-rich)
 
-The terminal renders entity bodies as MDX with a **closed component registry**. You may use these
-tags in any entity body to make the doc an interface; everywhere else (git, plain editors) they
-degrade to readable markup. Unknown tags or malformed MDX fall back to plain-markdown rendering —
-never invent tag names outside this list:
+The terminal renders entity bodies as MDX with a **closed component registry** — a doc can be an
+*interface*, not just text. Everywhere else (git, plain editors) the tags degrade to readable
+markup, so files stay portable. Unknown tags or malformed MDX fall back to plain-markdown
+rendering; never invent tag names outside this list.
 
-- `<Note>…</Note>` / `<Warning>…</Warning>` — callouts for context or risks.
-- `<Card title="…" icon="…" href="kg/…">…</Card>` inside `<CardGroup cols={2}>` — clickable
-  navigation cards; `href` to another entity doc opens it in-app. Icons: `user`, `building`,
-  `cal`, `tasks`, `file`, `folder`, `link`, `zap`, `spark`.
-- `<Steps><Step title="…">…</Step></Steps>` — numbered plans/processes.
-- `<Tabs><Tab title="…">…</Tab></Tabs>` — alternative views (e.g. Background / History).
+**The registry:**
 
-Use them where structure helps a human scanning the doc (plans → Steps, related entities →
-CardGroup, caveats → Warning); don't decorate for its own sake. `[[wikilinks]]` render as rich
-entity chips automatically — keep using them inline as the primary cross-reference.
+- `<Note>…</Note>` / `<Warning>…</Warning>` — callouts. Note = context worth surfacing (source,
+  freshness, caveat); Warning = risk or deadline the reader must not miss.
+- `<Card title="…" icon="…" href="kg/…">one-line teaser</Card>`, grouped in
+  `<CardGroup cols={2}>…</CardGroup>` — clickable navigation; an `href` to another workspace file
+  opens it in-app, external URLs open in the browser. Icons: `user`, `building`, `cal`, `tasks`,
+  `file`, `folder`, `link`, `zap`, `spark`, `web`, `git`.
+- `<Steps><Step title="…">…</Step></Steps>` — anything sequential: plans, processes, timelines.
+- `<Tabs><Tab title="…">…</Tab></Tabs>` — alternative views of the same subject
+  (e.g. Background / History, Agenda / Decisions).
+
+**Patterns that work well:**
+
+- `[[wikilinks]]` stay the primary inline cross-reference — they render automatically as entity
+  chips, colored by type (person/company/organization/project), no tags needed.
+- End a substantial entity doc with a `## Connected` section: a `CardGroup` of its 3–5 most
+  important related docs, each teaser saying *why* it's related (not "Referenced in this doc").
+- Meeting docs: `<Tabs>` for Agenda / Decisions / Follow-ups; a `<Warning>` for anything with a
+  deadline.
+- Project/plan docs: `<Steps>` for phases with owners as `[[wikilinks]]` inside each step.
+- `index.md` dashboards: a short `<Note>` saying what lives here + a `CardGroup` of the main
+  sub-pages with counts.
+
+Structure for the human scanning the doc; don't decorate for its own sake. A wall of components
+is worse than clean prose — one Note, one CardGroup, one Steps per doc is usually the ceiling.
+
+**MDX gotchas (these trigger the plain-markdown fallback for the WHOLE doc):**
+
+- A bare `<` followed by a letter starts a tag: write `a < b`, `5<10` with spaces, or backtick it.
+- Bare `{…}` is treated as an expression: backtick literal braces (`` `{"json": "like this"}` ``).
+- Every tag must close (`<Note>…</Note>`, self-close `<Card … />` only when it has no children).
+- Component tags need a blank line before and after them to keep the markdown inside them parsing.
+- The fallback is safe (the doc still renders as plain markdown) but loses all interactivity —
+  after writing components, re-read your output for these four mistakes.
 
 ## How to work
 
