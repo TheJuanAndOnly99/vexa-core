@@ -126,9 +126,17 @@ function FilesList() {
   useEffect(() => {
     // Never request dotfiles (hidden:false) — the `.git`/`.claude` listing 500s; the toggle is a client-side
     // kg-only vs full-workspace filter, not a dotfile switch.
-    void listWorkspaceTree({ hidden: false })
-      .then((t) => { setTree(t); setError(null); })
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
+    // The agent writes files continuously, so the tree self-refreshes: poll while the tab is
+    // visible + re-fetch on window focus. setTree only on change so React skips no-op renders.
+    const load = () => {
+      void listWorkspaceTree({ hidden: false })
+        .then((t) => { setTree((prev) => (JSON.stringify(prev) === JSON.stringify(t) ? prev : t)); setError(null); })
+        .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
+    };
+    load();
+    const id = setInterval(() => { if (!document.hidden) load(); }, 5000);
+    window.addEventListener("focus", load);
+    return () => { clearInterval(id); window.removeEventListener("focus", load); };
   }, [reloadKey]);
   const nodes = buildTree(kgOnly ? tree.filter((p) => p.startsWith("kg/")) : tree);
   // default expansion: top-level folders open, deeper folders collapsed (only when no saved state yet)
@@ -189,8 +197,12 @@ function FilesList() {
     <div style={{ padding: "6px 8px" }}>
       <div style={{ fontSize: 11, color: "var(--t3)", textTransform: "uppercase", letterSpacing: ".04em", padding: "6px 8px", display: "flex", alignItems: "center", gap: 6 }}>
         <span>knowledge</span>
+        <span onClick={() => setReloadKey((k) => k + 1)} title="Refresh the file list"
+          style={{ marginLeft: "auto", display: "flex", cursor: "pointer", color: "var(--t3)" }}>
+          <Icon name="refresh" size={13} />
+        </span>
         <span onClick={toggleKgOnly} title={kgOnly ? "Show all workspace files" : "Show only the knowledge graph"}
-          style={{ marginLeft: "auto", display: "flex", cursor: "pointer", color: kgOnly ? "var(--accent)" : "var(--t3)" }}>
+          style={{ display: "flex", cursor: "pointer", color: kgOnly ? "var(--accent)" : "var(--t3)" }}>
           <Icon name={kgOnly ? "eye" : "eyeOff"} size={13} />
         </span>
       </div>
