@@ -136,9 +136,9 @@ function LeftPane() {
         <img src="/vexa-logo.svg" alt="Vexa" width={24} height={24} style={{ borderRadius: 7, display: "block", flex: "none" }} />
         <span style={{ fontSize: 13, fontWeight: 500, color: "var(--t1)" }}>Vexa <span style={{ fontWeight: 400, color: "var(--t3)" }}>terminal</span></span>
       </div>
-      {/* one non-wrapping row at every sidebar width — overflow scrolls (hidden scrollbar)
-          instead of reflowing into a different-looking two-row layout */}
-      <div className="vx-hscroll" style={{ display: "flex", gap: 3, padding: "2px 8px 8px", borderBottom: "1px solid var(--line)", flex: "none" }}>
+      {/* stacked vertically — every list is visible at any sidebar width (no horizontal
+          overflow/scroll), matching the file-tree rows below */}
+      <div style={{ display: "flex", flexDirection: "column", gap: 2, padding: "2px 8px 8px", borderBottom: "1px solid var(--line)", flex: "none" }}>
         {lists.map((l) => (
           <button key={l.id} style={seg(l.id === active?.id)} onClick={() => layout.setActiveList(l.id)} title={l.label}>
             <Icon name={l.icon} size={13} />{l.label}

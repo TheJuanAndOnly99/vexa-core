@@ -40,6 +40,10 @@ export interface LayoutService {
   /** open the tab in a SPLIT next to the active panel (link-from-doc semantics: never
    *  replace the doc the user clicked in). Reuses the other group when one exists. */
   openTabBeside(d: TabDescriptor): void;
+  /** swap WHAT an existing panel shows in place (Obsidian-style in-pane navigation):
+   *  update its params + title without opening a new tab. `panelId` is the dockview
+   *  panel id (may be the preview slot). */
+  retargetTab(panelId: string, d: TabDescriptor): void;
   /** restore the UI state (dock layout + active list) from before the last navigation.
    *  Returns false when the history is empty. */
   goBack(): boolean;
@@ -189,6 +193,14 @@ export function createLayoutService(defaultList: string): LayoutService {
             ? { referencePanel: active.id, direction: "right" }
             : undefined,
       });
+    },
+    retargetTab(panelId, d) {
+      const panel = api?.getPanel(panelId);
+      if (!panel) return;
+      histPush();  // Escape / Alt+Left also undoes in-pane navigation
+      panel.api.updateParameters(panelParams(d, panelId === PREVIEW_PANEL));
+      panel.api.setTitle(d.title);
+      if (panelId === PREVIEW_PANEL) previewLogicalId = d.id;
     },
     openPreview(d) {
       if (!api) return;
