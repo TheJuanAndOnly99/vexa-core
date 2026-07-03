@@ -99,8 +99,10 @@ function Card({ title, icon, href, children }: { title?: string; icon?: string; 
   const clickable = Boolean(href);
   const open = () => {
     if (!href) return;
-    if (/^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith("//")) window.open(href, "_blank", "noreferrer");
-    else openEntity({ path: href.replace(/^\.\//, "") });
+    // scheme allowlist: http(s) opens externally, scheme-less opens in-workspace,
+    // anything else (javascript:, data:, //host) is untrusted-doc content — ignore
+    if (/^https?:/i.test(href)) window.open(href, "_blank", "noreferrer");
+    else if (!/^[a-z][a-z0-9+.-]*:/i.test(href) && !href.startsWith("//")) openEntity({ path: href.replace(/^\.\//, "") });
   };
   return (
     <div onClick={clickable ? open : undefined} onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}
@@ -183,7 +185,11 @@ const htmlComponents = {
           style={{ color: "var(--blue)", textDecoration: "underline", cursor: "pointer" }}>{children}</span>
       );
     }
-    return <a href={href} target="_blank" rel="noreferrer noopener" style={{ color: "var(--blue)", textDecoration: "underline" }}>{children}</a>;
+    // external: only http(s) and #anchors keep a live href — javascript:/data:/;
+    // //host from untrusted docs render as inert text
+    const safeHref = href && (/^https?:/i.test(href) || href.startsWith("#")) ? href : undefined;
+    if (!safeHref) return <span style={{ color: "var(--blue)" }}>{children}</span>;
+    return <a href={safeHref} target="_blank" rel="noreferrer noopener" style={{ color: "var(--blue)", textDecoration: "underline" }}>{children}</a>;
   },
   code: ({ children }: { children?: ReactNode }) => (
     <code style={{ fontFamily: "var(--mono)", fontSize: "0.88em", background: "var(--panel2)", border: "1px solid var(--line)", borderRadius: 4, padding: "0.5px 5px", color: "var(--t1)" }}>{children}</code>
@@ -211,6 +217,25 @@ const htmlComponents = {
 
 export const MDX_COMPONENTS = { ...htmlComponents, Note, Warning, Card, CardGroup, Steps, Step, Tabs, Tab, Wikilink };
 
+// ── security: forbid executable MDX ──────────────────────────────────────────
+// kg/ markdown is agent-written from meeting transcripts and external content, so it
+// is untrusted input. The component registry closes which TAGS resolve, but MDX
+// expressions (`{...}`), ESM (`import`/`export`), and expression-valued attributes
+// are arbitrary JS run in the viewer's session — reject them at the syntax tree and
+// let the throw route into the plain-Markdown fallback below.
+const FORBIDDEN_MDX_NODES = new Set(["mdxjsEsm", "mdxFlowExpression", "mdxTextExpression"]);
+function assertNoExecutableMdx(node: { type?: string; attributes?: unknown[]; children?: unknown[] }): void {
+  if (node.type && FORBIDDEN_MDX_NODES.has(node.type)) throw new Error(`executable MDX (${node.type}) is not allowed in workspace docs`);
+  for (const attr of (node.attributes ?? []) as { type?: string; value?: { type?: string } }[]) {
+    if (attr?.type === "mdxJsxExpressionAttribute" || attr?.value?.type === "mdxJsxAttributeValueExpression")
+      throw new Error("expression-valued JSX attributes are not allowed in workspace docs");
+  }
+  for (const child of (node.children ?? []) as { type?: string }[]) assertNoExecutableMdx(child);
+}
+function remarkForbidExecutable() {
+  return (tree: { type?: string; children?: unknown[] }) => assertNoExecutableMdx(tree);
+}
+
 // ── wikilink preprocessing: [[Title]] → <Wikilink title="Title" /> (skip code) ───
 function transformWikilinks(src: string): string {
   // split out fenced code blocks and inline code; only rewrite prose segments
@@ -233,7 +258,7 @@ export function MdxDoc({ children, style }: { children: string; style?: CSSPrope
   useEffect(() => {
     let cancelled = false;
     setState({ status: "loading" });
-    evaluate(transformWikilinks(src), { ...runtime, remarkPlugins: [remarkGfm] })
+    evaluate(transformWikilinks(src), { ...runtime, remarkPlugins: [remarkGfm, remarkForbidExecutable] })
       .then((mod) => { if (!cancelled) setState({ status: "ok", Content: mod.default }); })
       .catch((err: unknown) => { if (!cancelled) setState({ status: "fallback", error: String((err as Error)?.message ?? err) }); });
     return () => { cancelled = true; };
