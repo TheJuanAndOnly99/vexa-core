@@ -37,7 +37,7 @@ export function ContextMenu({ x, y, items, onClose }: {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const closeOutside = (e: PointerEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) onClose(); };
-    const closeEscape = (e: KeyboardEvent) => { if (e.key === "Escape") { e.stopPropagation(); onClose(); } };  // consume: close-topmost beats nav.back
+    const closeEscape = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
     document.addEventListener("pointerdown", closeOutside);
     document.addEventListener("keydown", closeEscape);
     return () => {

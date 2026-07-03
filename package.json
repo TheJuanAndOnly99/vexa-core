@@ -28,7 +28,8 @@
     "gate:node": "node scripts/gates.mjs node",
     "gate:licenses": "node scripts/gates.mjs licenses",
     "gate:calm": "npx -y @finos/calm-cli@1.47.1 validate -p calm/patterns/meeting-intelligence.pattern.json -a architecture.calm.json",
-    "gates": "node scripts/gates.mjs all"
+    "gates": "node scripts/gates.mjs all",
+    "arch:viz": "node scripts/arch-viz.mjs"
   },
   "devDependencies": {
     "ajv": "^8.17.0",
