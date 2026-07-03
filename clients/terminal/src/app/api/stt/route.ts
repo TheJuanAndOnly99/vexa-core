@@ -9,6 +9,7 @@
  *  LocalAgreement confirm/trim. The bearer token stays server-side.
  */
 import { NextResponse } from "next/server";
+import { resolveApiKey } from "../proxyAuth";
 
 export const runtime = "nodejs";
 
@@ -18,6 +19,11 @@ interface UpstreamWord { word?: string; start?: number; end?: number }
 interface UpstreamSegment { text?: string; words?: UpstreamWord[] }
 
 export async function POST(req: Request): Promise<NextResponse> {
+  // Auth gate: this forwards to the shared transcription service with a server-side
+  // bearer token. Without a check it's an open, credentialed Whisper proxy (cost/abuse
+  // vector) — require the same per-user key every other proxy route resolves.
+  if (!(await resolveApiKey())) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
   const base = (process.env.TRANSCRIPTION_SERVICE_URL ?? "").replace(/\/+$/, "");
   if (!base) return NextResponse.json({ error: "Transcription is not configured (TRANSCRIPTION_SERVICE_URL)" }, { status: 503 });
 
