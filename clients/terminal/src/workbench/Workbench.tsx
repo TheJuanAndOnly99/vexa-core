@@ -217,7 +217,7 @@ export function Workbench() {
   // resolve a [[wikilink]] title to its kg/entities/*.md path, then open the doc tab.
   useEffect(() => {
     const onOpenEntity = async (e: Event) => {
-      const detail = (e as CustomEvent<{ path?: string; wikilink?: string }>).detail || {};
+      const detail = (e as CustomEvent<{ path?: string; wikilink?: string; beside?: boolean }>).detail || {};
       let path = detail.path;
       if (!path && detail.wikilink) {
         const slug = entitySlug(detail.wikilink);
@@ -226,7 +226,9 @@ export function Workbench() {
       }
       if (!path) return;
       if (layout.store.getState().activeList === "sessions") layout.setActiveList("files");  // reveal the center
-      layout.openTab({ id: `doc:${path}`, title: path.split("/").pop() ?? path, kind: "doc", params: { path } });
+      const d = { id: `doc:${path}`, title: path.split("/").pop() ?? path, kind: "doc", params: { path } };
+      // beside = clicked inside a doc → split, keep the source visible; otherwise plain tab.
+      if (detail.beside) layout.openTabBeside(d); else layout.openTab(d);
     };
     window.addEventListener(OPEN_ENTITY_EVENT, onOpenEntity);
     return () => window.removeEventListener(OPEN_ENTITY_EVENT, onOpenEntity);

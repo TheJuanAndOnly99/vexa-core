@@ -20,14 +20,16 @@ import { Markdown } from "./Markdown";
 import { Icon } from "./index";
 
 function openEntity(detail: { path?: string; wikilink?: string }): void {
-  if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent(OPEN_ENTITY_EVENT, { detail }));
+  // beside: links clicked INSIDE a doc must never replace the doc being read — the
+  // workbench opens the target in a split group next to it.
+  if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent(OPEN_ENTITY_EVENT, { detail: { ...detail, beside: true } }));
 }
 
 // ── component registry (closed vocabulary — mirrors Mintlify tag names) ─────────
 
 // Entity-type → chip style (mirrors the TYPE map in surfaces/entities.tsx). Unknown or
 // unresolvable types (e.g. /mdx-demo with no gateway) fall back to the neutral blue chip.
-const CHIP: Record<string, { icon: string; color: string; bg: string }> = {
+export const ENTITY_CHIP: Record<string, { icon: string; color: string; bg: string }> = {
   person: { icon: "user", color: "var(--blue)", bg: "var(--bluebg)" },
   company: { icon: "building", color: "var(--accent)", bg: "var(--accentbg)" },
   organization: { icon: "web", color: "var(--violet)", bg: "var(--violetbg)" },
@@ -35,7 +37,7 @@ const CHIP: Record<string, { icon: string; color: string; bg: string }> = {
   meeting: { icon: "cal", color: "var(--violet)", bg: "var(--violetbg)" },
   task: { icon: "tasks", color: "var(--green)", bg: "var(--greenbg)" },
 };
-const DEFAULT_CHIP = { icon: "link", color: "var(--blue)", bg: "var(--bluebg)" };
+export const DEFAULT_ENTITY_CHIP = { icon: "link", color: "var(--blue)", bg: "var(--bluebg)" };
 
 // title → entity type, resolved once per session from the workspace tree
 // (slugified title matched against kg/entities/<type>/<slug>.md).
@@ -65,7 +67,7 @@ function Wikilink({ title }: { title: string }) {
     void entityTypes().then((m) => { if (on) setType(m.get(slugify(title)) ?? null); });
     return () => { on = false; };
   }, [title]);
-  const c = (type && CHIP[type]) || DEFAULT_CHIP;
+  const c = (type && ENTITY_CHIP[type]) || DEFAULT_ENTITY_CHIP;
   return (
     <span onClick={() => openEntity({ wikilink: title })}
       onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}

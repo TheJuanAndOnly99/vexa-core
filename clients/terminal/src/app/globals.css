@@ -6,13 +6,17 @@
  */
 :root {
   color-scheme: dark;
-  --bg: #0d0d0f;
-  --sidebar: #141417;
-  --panel: #191a1e;
-  --panel2: #1f2025;
-  --rail: #141417;
-  --line: rgba(255, 255, 255, 0.07);
-  --line2: rgba(255, 255, 255, 0.12);
+  /* Surface ladder — every adjacent pane sits on a DIFFERENT step so panes separate by
+   * value, not just hairlines (Claude Code desktop style): center canvas darkest, chat
+   * rail one step up, sidebar another, floating panels/cards lightest. Borders are
+   * always LIGHTER than both fills they divide. */
+  --bg: #0a0a0c;
+  --sidebar: #151519;
+  --panel: #1b1c21;
+  --panel2: #24252c;
+  --rail: #0f0f12;
+  --line: rgba(255, 255, 255, 0.09);
+  --line2: rgba(255, 255, 255, 0.16);
   --t1: #ededf0;
   --t2: #9a9aa4;
   --t3: #65656f;
@@ -39,13 +43,15 @@
  */
 :root[data-theme="light"] {
   color-scheme: light;
+  /* Light ladder mirrors dark: center lightest, rail a half step down, sidebar a full
+   * step, panels distinct from whatever they sit on. */
   --bg: #ffffff;
-  --sidebar: #f6f6f7;
-  --panel: #ffffff;
-  --panel2: #ebebee;
-  --rail: #f6f6f7;
-  --line: rgba(0, 0, 0, 0.09);
-  --line2: rgba(0, 0, 0, 0.14);
+  --sidebar: #f1f1f4;
+  --panel: #f8f8fa;
+  --panel2: #e9e9ee;
+  --rail: #fafafb;
+  --line: rgba(0, 0, 0, 0.10);
+  --line2: rgba(0, 0, 0, 0.16);
   --t1: #1a1a1f;
   --t2: #5c5c66;
   --t3: #8a8a94;
