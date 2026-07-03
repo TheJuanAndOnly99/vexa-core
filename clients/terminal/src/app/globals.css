@@ -6,15 +6,14 @@
  */
 :root {
   color-scheme: dark;
-  /* Surface ladder — every adjacent pane sits on a DIFFERENT step so panes separate by
-   * value, not just hairlines (Claude Code desktop style): center canvas darkest, chat
-   * rail one step up, sidebar another, floating panels/cards lightest. Borders are
-   * always LIGHTER than both fills they divide. */
-  --bg: #0a0a0c;
+  /* Unified base + lifted panels (per Dmitry 2026-07-03): sidebar, main and chat rail all
+   * sit on the SAME lighter base tone; separation comes from borders (always lighter than
+   * the fill) and from panels/cards lifting a step above the base. */
+  --bg: #151519;
   --sidebar: #151519;
-  --panel: #1b1c21;
-  --panel2: #24252c;
-  --rail: #0f0f12;
+  --panel: #1c1d22;
+  --panel2: #25262d;
+  --rail: #151519;
   --line: rgba(255, 255, 255, 0.09);
   --line2: rgba(255, 255, 255, 0.16);
   --t1: #ededf0;
@@ -43,13 +42,12 @@
  */
 :root[data-theme="light"] {
   color-scheme: light;
-  /* Light ladder mirrors dark: center lightest, rail a half step down, sidebar a full
-   * step, panels distinct from whatever they sit on. */
-  --bg: #ffffff;
-  --sidebar: #f1f1f4;
-  --panel: #f8f8fa;
-  --panel2: #e9e9ee;
-  --rail: #fafafb;
+  /* Light mirrors the unified base: one gray base everywhere, white cards lift off it. */
+  --bg: #f4f4f6;
+  --sidebar: #f4f4f6;
+  --panel: #ffffff;
+  --panel2: #e8e8ed;
+  --rail: #f4f4f6;
   --line: rgba(0, 0, 0, 0.10);
   --line2: rgba(0, 0, 0, 0.16);
   --t1: #1a1a1f;
@@ -85,7 +83,9 @@ body {
   --dv-background-color: var(--bg);
   --dv-group-view-background-color: var(--bg);
   --dv-tabs-and-actions-container-background-color: var(--sidebar);
-  --dv-activegroup-visiblepanel-tab-background-color: var(--bg);
+  /* base tones are unified, so the ACTIVE tab lifts to panel level instead of relying on
+   * a darker center canvas */
+  --dv-activegroup-visiblepanel-tab-background-color: var(--panel);
   --dv-activegroup-visiblepanel-tab-color: var(--t1);
   --dv-activegroup-hiddenpanel-tab-background-color: var(--sidebar);
   --dv-activegroup-hiddenpanel-tab-color: var(--t3);
