@@ -6,7 +6,6 @@
  *  and abort the upstream fetch when the client disconnects. */
 import type { NextRequest } from "next/server";
 import { resolveApiKey } from "../proxyAuth";
-import { meetingsOnly } from "../../mode";
 
 export const dynamic = "force-dynamic";
 
@@ -48,10 +47,6 @@ function proxyStream(upstreamBody: ReadableStream<Uint8Array>, abort: AbortContr
 }
 
 export async function POST(req: NextRequest) {
-  // Meetings-only mode: chat is an agent surface — refused at the edge like the catch-all's agent branch.
-  if (meetingsOnly()) {
-    return new Response(JSON.stringify({ error: "not_found", detail: "agent endpoints are disabled in meetings mode" }), { status: 404, headers: { "Content-Type": "application/json" } });
-  }
   const abort = new AbortController();
   const onClientGone = () => abort.abort();
   req.signal.addEventListener("abort", onClientGone);

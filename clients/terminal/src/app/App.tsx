@@ -15,14 +15,12 @@ import { Workbench } from "../workbench/Workbench";
 import { registry } from "../contributions";
 import { AuthGate } from "./AuthGate";
 import { OnboardingGate } from "./OnboardingGate";
-import { meetingsOnly } from "./mode";
 import "../surfaces";
 
 const container = createContainer([
   reg(ContextKeyServiceId, () => createContextKeyService()),
   reg(CommandServiceId, (c) => createCommandService(c)),
-  // Meetings-only mode has no Sessions list — land on Meetings instead.
-  reg(LayoutServiceId, () => createLayoutService(meetingsOnly() ? "meetings" : "sessions")),
+  reg(LayoutServiceId, () => createLayoutService("sessions")),
   reg(PaletteServiceId, () => createPaletteService()),
   reg(KeybindingServiceId, (c) => createKeybindingService(c)),
 ]);
