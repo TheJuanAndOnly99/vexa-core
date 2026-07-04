@@ -15,13 +15,12 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
 from llm.errors import preflight_provider_guard
-from llm.ports import HarnessExec
+from llm.ports import HarnessExec, scrubbed_git_env
 
 
 def _short(content: object, n: int = 80) -> str:
@@ -122,7 +121,10 @@ def build_argv(
 
 
 def _exec_subprocess(argv: list[str], cwd: str) -> Iterator[str]:
-    proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    # scrubbed_git_env: the harness runs git inside the workspace; a hook-exported GIT_DIR would
+    # re-point those ops (and the workspace's own repo discovery) at the hook's repo.
+    proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                            env=scrubbed_git_env())
     assert proc.stdout is not None
     try:
         yield from proc.stdout
@@ -136,7 +138,13 @@ def _link_chat_into_workspace(work: Path) -> None:
     per-turn container is recreated (no memory). Symlink that dir into the workspace's ``.claude/projects``
     so the chat is written to the durable git folder and ``--resume`` reads it back across turns. We keep
     it under ``.claude`` (excluded from the governance ``git clean``) so a rejected turn never wipes the
-    history; it persists on the workspace volume."""
+    history; it persists on the workspace volume.
+
+    SAFETY: only the disposable per-turn container HOME may be rewritten. Outside the container
+    (a host test run, a developer shell) ``~/.claude/projects`` holds the developer's REAL session
+    transcripts — this function must never delete data it didn't create. A pre-existing directory
+    is therefore replaced only when EMPTY (``rmdir``, which cannot destroy content); a non-empty
+    one is left alone and the link is skipped — the turn still works, without cross-turn resume."""
     ws_projects = work / ".claude" / "projects"
     ws_projects.mkdir(parents=True, exist_ok=True)
     home_claude = Path(os.environ.get("HOME", "/root")) / ".claude"
@@ -147,8 +155,12 @@ def _link_chat_into_workspace(work: Path) -> None:
             if os.readlink(link) == str(ws_projects):
                 return
             link.unlink()
+        elif link.is_dir():
+            if any(link.iterdir()):
+                return  # real transcripts live here — never delete, skip the link
+            link.rmdir()  # empty dir: safe to replace, nothing can be lost
         elif link.exists():
-            shutil.rmtree(link, ignore_errors=True)
+            return  # some other filesystem object — don't clobber
         link.symlink_to(ws_projects, target_is_directory=True)
     except OSError:
         pass  # best-effort; a fresh turn still works, just without cross-turn resume

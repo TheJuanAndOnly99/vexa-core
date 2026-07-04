@@ -98,7 +98,9 @@ def _compose(*args: str, env: dict | None = None, check: bool = True, timeout: i
 
 def _stack_env() -> dict:
     return {
-        "IMAGE_TAG": "dev",
+        # dev = the locally-built images (the routine gate). Release CI overrides this to pin the
+        # PUBLISHED :vX.Y.Z tag (with COMPOSE_NO_BUILD=1), so the proof runs against the artifacts.
+        "IMAGE_TAG": os.getenv("IMAGE_TAG", "dev"),
         # Pin the project name into the interpolation env too (not just `-p`), so the compose's
         # DOCKER_NETWORK=${COMPOSE_PROJECT_NAME}_vexa resolves to the SAME network compose creates —
         # the bot must be spawned onto it to reach meeting-api/redis.
@@ -106,7 +108,7 @@ def _stack_env() -> dict:
         "ADMIN_TOKEN": ADMIN_TOKEN,
         "INTERNAL_API_SECRET": INTERNAL_API_SECRET,
         "MINIO_BUCKET": MINIO_BUCKET,
-        "BROWSER_IMAGE": os.getenv("BROWSER_IMAGE", "vexaai/vexa-bot:dev"),
+        "BROWSER_IMAGE": os.getenv("BROWSER_IMAGE", "vexaai/vexa-bot:v012"),
         "API_GATEWAY_HOST_PORT": GATEWAY_PORT,
         "ADMIN_API_PORT": ADMIN_API_HOST_PORT,
         "MEETING_API_PORT": MEETING_API_HOST_PORT,
@@ -235,7 +237,10 @@ def stack():
     # Clean any prior gate run, then bring it up + build (P4 images are cached → fast on a warm host).
     _compose("down", "-v", "--remove-orphans", check=False)
     build = os.getenv("COMPOSE_NO_BUILD") != "1"
-    up_args = ["up", "-d", "--remove-orphans"] + (["--build"] if build else [])
+    # --no-build must be EXPLICIT: without it, compose silently falls back to building from the
+    # working tree when a pinned image can't be pulled — the release validation would then "prove"
+    # local layers instead of the published artifacts it exists to verify.
+    up_args = ["up", "-d", "--remove-orphans"] + (["--build"] if build else ["--no-build"])
     _compose(*up_args, timeout=1800)
 
     s = Stack()
@@ -256,11 +261,14 @@ def stack():
 
 
 def _cleanup(s: Stack) -> None:
-    # Remove any bot containers the runtime spawned on the HOST daemon (default-bridge, outside the
-    # compose project) so `down -v` leaves nothing behind.
+    # Remove any bot containers the runtime spawned on the HOST daemon (outside the compose project)
+    # so `down -v` leaves nothing behind. Scoped to THIS project's network: the runtime attaches every
+    # workload to DOCKER_NETWORK=${COMPOSE_PROJECT_NAME}_vexa, and a bare name=^vexa-mtg- would rm -f
+    # ANOTHER stack's live meeting bots on a shared host (the exact bbb-prod-box scenario COMPOSE_PROJECT
+    # exists for).
     try:
         names = subprocess.run(
-            ["docker", "ps", "-aq", "--filter", "name=^vexa-mtg-"],
+            ["docker", "ps", "-aq", "--filter", "name=^vexa-mtg-", "--filter", f"network={PROJECT}_vexa"],
             capture_output=True, text=True, timeout=30,
         ).stdout.split()
         if names:
