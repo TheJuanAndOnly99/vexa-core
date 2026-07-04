@@ -1,9 +1,8 @@
 """agent_config — the governed, workspace-driven meeting-copilot config (agents/meeting.md).
 
 Proves the isolated parser: all defaults when absent, per-key fallback on partial frontmatter, body
-becomes steering, tolerant of malformed YAML / no frontmatter — and the PROVIDER-AGNOSTIC model
-governance: a model is a free string; VEXA_MEETING_MODEL → VEXA_LLM_MODEL resolve the deployment
-default at call time; the OPTIONAL operator allowlist (VEXA_MODEL_ALLOWLIST) gates workspace pins.
+becomes steering, bad-model falls back to the default, enabled=false honored, and tolerant of
+malformed YAML / no frontmatter.
 """
 from __future__ import annotations
 
@@ -12,11 +11,11 @@ from pathlib import Path
 from shared.agent_config import (
     DEFAULT_CADENCE_SEGMENTS,
     DEFAULT_CARD_KINDS,
+    DEFAULT_MEETING_MODEL,
     DEFAULT_POLISH_RULES,
     DEFAULT_TAG_RULES,
-    default_meeting_model,
+    MODEL_ALLOWLIST,
     load_meeting_config,
-    model_allowlist,
 )
 
 
@@ -26,83 +25,57 @@ def _write(work: Path, text: str) -> None:
     p.write_text(text)
 
 
-def _clear_model_env(monkeypatch) -> None:
-    for var in ("VEXA_MEETING_MODEL", "VEXA_LLM_MODEL", "VEXA_MODEL_ALLOWLIST"):
-        monkeypatch.delenv(var, raising=False)
-
-
-def test_absent_file_all_defaults(tmp_path, monkeypatch):
-    _clear_model_env(monkeypatch)
+def test_absent_file_all_defaults(tmp_path):
     cfg = load_meeting_config(tmp_path)
     assert cfg.enabled is True
-    assert cfg.model == ""  # no env, no pin → the provider adapter's own default
+    assert DEFAULT_MEETING_MODEL == "deepseek/deepseek-v4-flash"
+    assert DEFAULT_MEETING_MODEL in MODEL_ALLOWLIST
+    assert cfg.model == DEFAULT_MEETING_MODEL
     assert cfg.cadence_segments == DEFAULT_CADENCE_SEGMENTS
     assert cfg.card_kinds == list(DEFAULT_CARD_KINDS)
     assert cfg.write_meeting_doc is True
     assert cfg.steering == ""
 
 
-def test_full_config_parsed(tmp_path, monkeypatch):
-    _clear_model_env(monkeypatch)
-    _write(tmp_path, (
-        "---\n"
-        "enabled: false\n"
-        "model: any-provider/route-v9\n"
-        "cadence_segments: 7\n"
-        "card_kinds: [person, action]\n"
-        "write_meeting_doc: false\n"
-        "---\n"
-        "Watch only for budget commitments. Ignore small talk.\n"
-    ))
-    cfg = load_meeting_config(tmp_path)
+def test_full_config_parsed():
+    # pick a real allowlisted non-default model
+    model = next(m for m in MODEL_ALLOWLIST if m != DEFAULT_MEETING_MODEL)
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        work = Path(d)
+        _write(work, (
+            "---\n"
+            "enabled: false\n"
+            f"model: {model}\n"
+            "cadence_segments: 7\n"
+            "card_kinds: [person, action]\n"
+            "write_meeting_doc: false\n"
+            "---\n"
+            "Watch only for budget commitments. Ignore small talk.\n"
+        ))
+        cfg = load_meeting_config(work)
     assert cfg.enabled is False
-    assert cfg.model == "any-provider/route-v9"  # free string — no vendor allowlist in code
+    assert cfg.model == model
     assert cfg.cadence_segments == 7
     assert cfg.card_kinds == ["person", "action"]
     assert cfg.write_meeting_doc is False
     assert "budget commitments" in cfg.steering
 
 
-def test_default_meeting_model_env_resolution(monkeypatch):
-    _clear_model_env(monkeypatch)
-    assert default_meeting_model() == ""
-    monkeypatch.setenv("VEXA_LLM_MODEL", "deployment-default")
-    assert default_meeting_model() == "deployment-default"
-    monkeypatch.setenv("VEXA_MEETING_MODEL", "meeting-override")
-    assert default_meeting_model() == "meeting-override"  # meeting-specific env wins
-
-
-def test_partial_frontmatter_per_key_fallback(tmp_path, monkeypatch):
-    _clear_model_env(monkeypatch)
-    monkeypatch.setenv("VEXA_LLM_MODEL", "deployment-default")
+def test_partial_frontmatter_per_key_fallback(tmp_path):
     _write(tmp_path, "---\ncadence_segments: 2\n---\njust steering text\n")
     cfg = load_meeting_config(tmp_path)
-    assert cfg.cadence_segments == 2                 # set
-    assert cfg.enabled is True                       # fell back
-    assert cfg.model == "deployment-default"         # fell back to env default
+    assert cfg.cadence_segments == 2           # set
+    assert cfg.enabled is True                 # fell back
+    assert cfg.model == DEFAULT_MEETING_MODEL  # fell back
     assert cfg.card_kinds == list(DEFAULT_CARD_KINDS)
     assert cfg.steering == "just steering text"
 
 
-def test_model_allowlist_gates_workspace_pin(tmp_path, monkeypatch):
-    """With VEXA_MODEL_ALLOWLIST set, an off-list workspace pin falls back to the deployment
-    default (a typo cannot silently pin an unexpected route); an on-list pin passes."""
-    _clear_model_env(monkeypatch)
-    monkeypatch.setenv("VEXA_LLM_MODEL", "deployment-default")
-    monkeypatch.setenv("VEXA_MODEL_ALLOWLIST", "good-model, another-model")
-    assert model_allowlist() == frozenset({"good-model", "another-model"})
-
+def test_bad_model_falls_back_to_default(tmp_path):
     _write(tmp_path, "---\nmodel: gpt-4o-mega\n---\n")
-    assert load_meeting_config(tmp_path).model == "deployment-default"  # gated out
-
-    _write(tmp_path, "---\nmodel: good-model\n---\n")
-    assert load_meeting_config(tmp_path).model == "good-model"          # allowed through
-
-
-def test_no_allowlist_means_any_model_passes(tmp_path, monkeypatch):
-    _clear_model_env(monkeypatch)
-    _write(tmp_path, "---\nmodel: gpt-4o-mega\n---\n")
-    assert load_meeting_config(tmp_path).model == "gpt-4o-mega"
+    cfg = load_meeting_config(tmp_path)
+    assert cfg.model == DEFAULT_MEETING_MODEL
 
 
 def test_bad_cadence_falls_back(tmp_path):

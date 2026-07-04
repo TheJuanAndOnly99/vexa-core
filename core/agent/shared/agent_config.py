@@ -21,20 +21,22 @@ import yaml
 
 log = logging.getLogger(__name__)
 
-# PROVIDER-AGNOSTIC model governance: a model is a FREE STRING the llm module's provider adapter
-# interprets — NO vendor names or committed model list live in code. Resolution (call-time, so a
-# respawned worker sees current env): VEXA_MEETING_MODEL (meeting-specific) → VEXA_LLM_MODEL (the
-# deployment default) → "" (the adapter's own default, or fail-loud where a model is required).
-def default_meeting_model() -> str:
-    return os.environ.get("VEXA_MEETING_MODEL") or os.environ.get("VEXA_LLM_MODEL") or ""
+# The default live-meeting model. Env (``VEXA_MEETING_MODEL``) can pin an operator-selected route; the
+# committed fallback is a CAPABLE route so cleaning/cards are reliable out of the box (reliability over
+# the old zero-cost "openrouter/free" default).
+DEFAULT_MEETING_MODEL = os.environ.get("VEXA_MEETING_MODEL") or "deepseek/deepseek-v4-flash"
 
-
-def model_allowlist() -> frozenset[str]:
-    """The OPTIONAL operator gate on workspace-pinned models: ``VEXA_MODEL_ALLOWLIST`` (comma-
-    separated). Empty/unset ⇒ allow any route — the config file is governed but user-editable, so
-    operators who need to bound spend or routes set the env; nobody else pays a code-change."""
-    raw = os.environ.get("VEXA_MODEL_ALLOWLIST", "")
-    return frozenset(m.strip() for m in raw.split(",") if m.strip())
+# A model named in config must be on this allowlist. Anything else falls back to the default with a log
+# line; the config file is governed but user-editable, so a typo cannot silently pin an unexpected route.
+MODEL_ALLOWLIST: frozenset[str] = frozenset({
+    "openrouter/free",
+    "deepseek/deepseek-v4-flash",
+    "claude-haiku-4-5-20251001",
+    "claude-sonnet-4-20250514",
+    "claude-sonnet-4-5-20250929",
+    "claude-opus-4-20250514",
+    "claude-opus-4-1-20250805",
+})
 
 DEFAULT_CARD_KINDS: tuple[str, ...] = ("person", "company", "product")
 DEFAULT_CADENCE_SEGMENTS = 4
@@ -53,9 +55,9 @@ DEFAULT_POLISH_RULES = (
     "(\"Speaker says\", \"the speaker describes\", \"they talk about\")."
 )
 DEFAULT_TAG_RULES = (
-    "Highlight ENTITY KEYWORDS worth researching: people, companies, and products/technologies "
-    "mentioned by name. Surface only concrete named entities present in the lines — do not invent. "
-    "Do NOT tag signals (decisions, action items, questions, claims) or plain numbers; entities only."
+    "Extract two kinds of tags from THESE lines and mark them actionable. (1) ENTITIES: person, "
+    "company, product, and any concrete number. (2) SIGNALS: decision, action-item, question, and "
+    "claim. Surface only what is concretely present in the lines — do not invent."
 )
 
 
@@ -64,7 +66,7 @@ class MeetingConfig:
     """The resolved meeting-copilot knobs (every field has a code default; see ``load_meeting_config``)."""
 
     enabled: bool = True
-    model: str = field(default_factory=default_meeting_model)
+    model: str = DEFAULT_MEETING_MODEL
     cadence_segments: int = DEFAULT_CADENCE_SEGMENTS
     card_kinds: list[str] = field(default_factory=lambda: list(DEFAULT_CARD_KINDS))
     write_meeting_doc: bool = True
@@ -106,20 +108,15 @@ def _as_bool(val: object, default: bool) -> bool:
 
 
 def _as_model(val: object) -> str:
-    """A workspace-pinned model is a free string passed through to the provider adapter. When the
-    operator set ``VEXA_MODEL_ALLOWLIST``, an off-list route falls back to the deployment default
-    with a log line (a typo cannot silently pin an unexpected route); with no allowlist, any
-    non-blank route passes."""
     if isinstance(val, str) and val.strip():
         candidate = val.strip()
-        allow = model_allowlist()
-        if not allow or candidate in allow:
+        if candidate in MODEL_ALLOWLIST:
             return candidate
         log.warning(
-            "agents/meeting.md: model %r not in VEXA_MODEL_ALLOWLIST — falling back to default %r",
-            candidate, default_meeting_model(),
+            "agents/meeting.md: model %r not in allowlist — falling back to default %r",
+            candidate, DEFAULT_MEETING_MODEL,
         )
-    return default_meeting_model()
+    return DEFAULT_MEETING_MODEL
 
 
 def _as_cadence(val: object) -> int:

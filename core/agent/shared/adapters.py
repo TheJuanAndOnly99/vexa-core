@@ -26,7 +26,6 @@ from typing import Protocol
 
 import yaml
 
-from shared.gitenv import scrubbed_git_env
 from shared.models import WorkspaceWrite
 from shared.ports import IdentityPort, RuntimePort, SchedulerPort, StreamReader, VcsPort, WorkspacePort
 
@@ -56,10 +55,12 @@ def parse_entity(text: str) -> tuple[dict, str]:
 
 def _git(cwd: Path, *args: str, token: str | None = None) -> str:
     """Run a git command in ``cwd``; return trimmed stdout. ``token`` (if given) is passed via env
-    for the duration of the call only and is NEVER placed on the argv (which can leak via ps).
-    Always runs on a scrubbed env — a hook-exported GIT_DIR must never re-point the workspace op
-    at the hook's repo (see shared/gitenv.py)."""
-    env = scrubbed_git_env(GIT_ASKPASS="true") if token is not None else scrubbed_git_env()
+    for the duration of the call only and is NEVER placed on the argv (which can leak via ps)."""
+    env = None
+    if token is not None:
+        import os
+
+        env = {**os.environ, "GIT_ASKPASS": "true"}  # never interactively prompt
     proc = subprocess.run(
         ["git", *args],
         cwd=str(cwd),
@@ -93,7 +94,7 @@ class RealGitWorkspace(WorkspacePort):
         # Local clone (file path or file:// URL) — derived from parent git_clone_init.
         subprocess.run(
             ["git", "clone", repo_url, str(self.work_dir)],
-            capture_output=True, text=True, check=True, env=scrubbed_git_env(),
+            capture_output=True, text=True, check=True,
         )
         name, email = self._identity
         _git(self.work_dir, "config", "user.name", name)

@@ -1,6 +1,5 @@
 import type { Metadata } from "next";
 import "./globals.css";
-import { Analytics } from "./Analytics";
 
 export const metadata: Metadata = {
   title: "Vexa Terminal",
@@ -15,10 +14,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         {/* apply the saved theme before first paint so day mode doesn't flash dark on reload */}
         <script dangerouslySetInnerHTML={{ __html: `try{if(localStorage.getItem('vexa.terminal.theme')==='light')document.documentElement.setAttribute('data-theme','light')}catch(e){}` }} />
       </head>
-      <body>
-        {children}
-        <Analytics />
-      </body>
+      <body>{children}</body>
     </html>
   );
 }
