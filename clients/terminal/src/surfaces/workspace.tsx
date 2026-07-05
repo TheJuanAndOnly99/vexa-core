@@ -14,9 +14,13 @@ import { ContextMenu, copyText } from "../ui-kit/ContextMenu";
 import { MdxDoc } from "../ui-kit/MdxDoc";
 // Data-access lives in its own SoC module (scoped to the authed user — no client subject, P20),
 // proven in isolation by workspaceApi.test.ts.
-import { readWorkspaceFile, listWorkspaceTree, readWorkspaceGit, readAttachedWorkspaces, swapWorkspace, renameWorkspace, publishWorkspace, readActiveSet, activateWorkspace, deactivateWorkspace, type GitState, type AttachedWorkspaces, type PublishResult, type ActiveMount } from "./workspaceApi";
+import { readWorkspaceFile, listWorkspaceTree, readWorkspaceGit, readAttachedWorkspaces, renameWorkspace, publishWorkspace, readActiveSet, activateWorkspace, deactivateWorkspace, createWorkspace, type GitState, type AttachedWorkspaces, type PublishResult, type ActiveMount } from "./workspaceApi";
 const base = (p: string) => p.split("/").pop() ?? p;
-const docTab = (path: string) => ({ id: `doc:${path}`, title: base(path), kind: "doc", params: { path } });
+// `slug` (Lane A) opens a file from a SHARED workspace the user is a member of; omitted → own workspace.
+// The tab id includes the slug so the same path in two workspaces gets distinct tabs.
+const docTab = (path: string, slug?: string) => ({
+  id: slug ? `doc:${slug}:${path}` : `doc:${path}`, title: base(path), kind: "doc", params: { path, slug },
+});
 
 function parseEntity(text: string): { fm: [string, string][]; body: string } {
   const m = text.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
@@ -57,8 +61,8 @@ function revealInTree(dir: string): void {
   if (!dir.startsWith("kg")) writeSS(SS_HIDDEN, "0");  // target hidden by the kg-only filter → reveal all
   window.dispatchEvent(new CustomEvent(REVEAL_PATH_EVENT, { detail: { dir } }));
 }
-async function readFile(path: string): Promise<string> {
-  return (await readWorkspaceFile(path)) ?? "(not found)";
+async function readFile(path: string, slug?: string): Promise<string> {
+  return (await readWorkspaceFile(path, slug ? { slug } : undefined)) ?? "(not found)";
 }
 
 // ── session-persisted UI flags ───────────────────────────────────────────────────
@@ -121,6 +125,50 @@ function TreeRow({ node, depth, expanded, toggle, openFile, pinFile, openMenu }:
   );
 }
 
+// ── shared-workspace section (Lane A) ─────────────────────────────────────────────
+// One collapsible READ-ONLY section per SHARED workspace the user is a member of (from the active set).
+// Its kg tree is fetched scoped by slug; files open read-only via docTab(path, slug). Additive: the
+// primary KNOWLEDGE tree above is untouched, so the single-workspace view can never regress.
+function SharedTreeSection({ mount }: { mount: ActiveMount }) {
+  const layout = useService(LayoutServiceId);
+  const [tree, setTree] = useState<string[]>([]);
+  const [open, setOpen] = useState(true);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    const load = () => void listWorkspaceTree({ hidden: false, slug: mount.slug })
+      .then((t) => { setTree((prev) => (JSON.stringify(prev) === JSON.stringify(t) ? prev : t)); setError(null); })
+      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
+    load();
+    const id = setInterval(() => { if (!document.hidden) load(); }, 8000);
+    window.addEventListener("focus", load);
+    return () => { clearInterval(id); window.removeEventListener("focus", load); };
+  }, [mount.slug, open]);
+  const nodes = buildTree(tree.filter((p) => p.startsWith("kg/")));  // kg-only, same default as the primary
+  const toggleDir = (p: string) => setExpanded((prev) => { const n = new Set(prev); n.has(p) ? n.delete(p) : n.add(p); return n; });
+  const openDoc = (p: string) => layout.openPreview(docTab(p, mount.slug));
+  const pinDoc = (p: string) => layout.openTab(docTab(p, mount.slug));
+  return (
+    <div style={{ marginTop: 2 }}>
+      <div onClick={() => setOpen((v) => !v)} title="Shared workspace — read-only"
+        style={{ display: "flex", alignItems: "center", gap: 5, padding: "6px 8px", cursor: "pointer",
+          fontSize: 11, color: "var(--t3)", textTransform: "uppercase", letterSpacing: ".04em" }}>
+        <Icon name="chevR" size={12} style={{ transform: open ? "rotate(90deg)" : "none", transition: "transform .12s" }} />
+        <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{mount.slug}</span>
+        <span style={{ marginLeft: "auto", fontSize: 9.5, letterSpacing: 0, textTransform: "none", color: "var(--t3)",
+          border: "1px solid var(--line)", borderRadius: 5, padding: "0 5px" }}>shared · read-only</span>
+      </div>
+      {open && (<>
+        {error && <div role="alert" style={{ margin: "0 8px 6px", fontSize: 11.5, color: "var(--live)" }}>⚠ {error}</div>}
+        {nodes.map((n) => <TreeRow key={n.path} node={n} depth={0} expanded={expanded} toggle={toggleDir}
+          openFile={openDoc} pinFile={pinDoc} openMenu={() => {}} />)}
+        {!error && tree.length === 0 && <div style={{ padding: "3px 12px", color: "var(--t3)", fontSize: 12 }}>Empty.</div>}
+      </>)}
+    </div>
+  );
+}
+
 // ── Files LIST (left) ───────────────────────────────────────────────────────────
 const SS_EXPANDED = "ws.tree.expanded", SS_HIDDEN = "ws.tree.hidden";
 function FilesList() {
@@ -132,6 +180,8 @@ function FilesList() {
   // Knowledge view defaults to ONLY the knowledge graph (kg/); the eye toggle reveals the rest of the
   // workspace scaffold (CLAUDE.md, agents/, skills/, views/, …). Default ON = kg-only.
   const [kgOnly, setKgOnly] = useState<boolean>(() => readSS(SS_HIDDEN) !== "0");
+  // Lane A: the SHARED workspaces in the active set — rendered as read-only sections beneath the primary tree.
+  const [sharedMounts, setSharedMounts] = useState<ActiveMount[]>([]);
   const [expanded, setExpanded] = useState<Set<string>>(() => {
     try { const a = JSON.parse(readSS(SS_EXPANDED) ?? "null"); return new Set(Array.isArray(a) ? a : []); } catch { return new Set(); }
   });
@@ -145,8 +195,14 @@ function FilesList() {
         .then((t) => { setTree((prev) => (JSON.stringify(prev) === JSON.stringify(t) ? prev : t)); setError(null); })
         .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
     };
+    // Lane A: resolve the shared workspaces in the active set (best-effort — a failure just hides the
+    // shared sections, never the primary tree).
+    const loadShared = () => void readActiveSet()
+      .then((s) => setSharedMounts(s.active.filter((m) => m.role === "shared")))
+      .catch(() => { /* shared sections are additive; ignore */ });
     load();
-    const id = setInterval(() => { if (!document.hidden) load(); }, 5000);
+    loadShared();
+    const id = setInterval(() => { if (!document.hidden) { load(); loadShared(); } }, 5000);
     window.addEventListener("focus", load);
     return () => { clearInterval(id); window.removeEventListener("focus", load); };
   }, [reloadKey]);
@@ -254,6 +310,8 @@ function FilesList() {
           { id: "copy-path", label: "Copy path", detail: menu.path, onSelect: () => copyText(menu.path) },
         ]} />
       )}
+      {/* Lane A: shared workspaces (member-of) as read-only KNOWLEDGE sections — the agent mounts them too. */}
+      {!q && sharedMounts.map((mount) => <SharedTreeSection key={mount.slug} mount={mount} />)}
       <WorkspaceSwitcher onSwapped={() => setReloadKey((k) => k + 1)} />
       <GitSection />
     </div>
@@ -304,11 +362,12 @@ export function WorkspaceSwitcher({ onSwapped }: { onSwapped: () => void }) {  /
     finally { setBusy(false); }
   };
 
-  // Swap to an existing slot by SLUG (restores the parked tree, no re-clone). Retained for the
-  // list-level 'Start fresh' action (#59): a seed-fresh rebuild that re-homes the private baseline.
-  const swapToSlot = async (slug: string, fresh?: boolean) => {
+  // CREATE a brand-new BLANK workspace and ADD it to the mount set (additive — the "new workspace" list
+  // action). NOT a swap: the private baseline and every other active workspace are left untouched (nothing
+  // parked/rebuilt/backed up). The new row loads back CHECKED (it joined the active set).
+  const doNewWorkspace = async () => {
     setBusy(true); setErr(null);
-    try { await swapWorkspace(undefined, undefined, undefined, fresh, slug); load(); onSwapped(); }
+    try { await createWorkspace(); load(); onSwapped(); }
     catch (e) { setErr(e instanceof Error ? e.message : String(e)); }
     finally { setBusy(false); }
   };
@@ -429,13 +488,15 @@ export function WorkspaceSwitcher({ onSwapped }: { onSwapped: () => void }) {  /
             </div>
           </div>
         )}
-        {/* Start fresh is a LIST-LEVEL action (not a row icon): it CREATES a new default workspace —
-            the current one is parked as a recoverable backup ('default (previous)') — so it lives
-            alongside "+ Attach repo…" as the other way to bring a new workspace into the list. */}
-        <div onClick={() => { if (!busy && window.confirm("Start fresh? The default workspace is rebuilt from the template. Your current default is kept under a recoverable backup ('default (previous)').")) void swapToSlot("seed", true); }}
-          title="Start fresh — rebuild the default from the template (current default kept as a backup)"
+        {/* New workspace is a LIST-LEVEL action (not a row icon): it CREATES a fresh blank workspace
+            (seeded from the template) and ADDS it to the mount set — additive, so it destroys nothing and
+            leaves the baseline + every other workspace untouched. It lives alongside "+ Attach repo…" as
+            the two ways to bring a new workspace into the set. No confirmation: creating a workspace is
+            non-destructive. The new row appears CHECKED (it joined the active set). */}
+        <div onClick={() => { if (!busy) void doNewWorkspace(); }}
+          title="New workspace — create a blank workspace and add it to your set (nothing is replaced)"
           style={{ padding: "5px 9px", fontSize: 12, color: "var(--accent)", cursor: "pointer", display: "flex", alignItems: "center", gap: 6, opacity: busy ? 0.6 : 1 }}>
-          <Icon name="plus" size={12} /> Start fresh…
+          <Icon name="plus" size={12} /> New workspace…
         </div>
         {/* Publish / push-updates form — opened from the ACTIVE row's ↑ action (no list-level trigger:
             publish is an action on the active workspace, not a new list entry). Push-updates mode
@@ -646,6 +707,7 @@ function NavArrow({ dir, enabled, onGo }: { dir: -1 | 1; enabled: boolean; onGo:
 function DocTab({ id, params }: TabProps) {
   const layout = useService(LayoutServiceId);
   const docked = params.path as string;
+  const slug = params.slug as string | undefined;  // Lane A: shared-workspace source (read-only), if any
   // Obsidian-style per-pane history: links inside the doc navigate THIS pane in place
   // (layout.retargetTab keeps the dockview panel's params/title in sync); the ‹ › arrows
   // walk the pane's own back/forward stack.
@@ -658,9 +720,9 @@ function DocTab({ id, params }: TabProps) {
   useEffect(() => {
     setContent(null);
     scroller.current?.scrollTo(0, 0);
-    void readFile(path).then(setContent);
-  }, [path]);
-  const show = (p: string) => layout.retargetTab(id, docTab(p));
+    void readFile(path, slug).then(setContent);
+  }, [path, slug]);
+  const show = (p: string) => layout.retargetTab(id, docTab(p, slug));
   const navigate: DocNavigate = (detail) => {
     void (async () => {
       const p = detail.path ?? (detail.wikilink ? await resolveWikilink(detail.wikilink) : undefined);

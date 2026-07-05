@@ -42,6 +42,10 @@ SEED_BACKUP_SLOT = "seed-prev"  # where 'start fresh' tucks the displaced defaul
 # slug in the active set is whatever ``state.active`` points at (the seed by default). This slug marks
 # the workspace that lives at the legacy in-place path and is ALWAYS active + non-deactivatable.
 PRIVATE_ROLE = "private"
+# A SHARED workspace mount (Lane A): a workspace the subject is a MEMBER of (not their own), resolved from
+# the membership index + authoritatively re-checked against the workspace's own policy/members.json. Write
+# access is gated by the member's role (contributor/owner write; viewer is read-only).
+SHARED_ROLE = "shared"
 
 # Inject the actual clone for tests (a local file repo, no network). Signature: (repo_url, ref, dest, token).
 CloneFn = Callable[[str, str, Path, Optional[str]], None]
@@ -366,6 +370,45 @@ def active_workspaces(root: str | Path, subject: str) -> list[ActiveMount]:
     return mounts
 
 
+def shared_active_mounts(root: str | Path, subject: str, memberships: list[dict]) -> list[ActiveMount]:
+    """The SHARED workspaces the subject is a MEMBER of (Lane A) — the seam that turns a membership grant
+    into a mount in the active set. ``memberships`` is the derived index ``users.data.memberships[]`` (each
+    ``{workspace_id, role, ...}``), used ONLY to ENUMERATE candidate workspaces; the role that gates WRITE
+    is re-read AUTHORITATIVELY from each workspace's own ``policy/members.json`` (via ``is_member``), because
+    the index is a convenience copy and must never be trusted for authorization.
+
+    A candidate is dropped (never mounted) when: it is the subject's own baseline, a reserved/dot slug, its
+    repo is not materialized on this node, or the authoritative check says the subject is NOT a member (a
+    stale index entry). Surviving members mount READ-ONLY for viewers, READ-WRITE for contributor/owner.
+    Pure + path-driven (no DB, no network) so the mapping is unit-tested offline."""
+    # Deferred import to keep the module-load order clean (workspace_membership owns the authoritative
+    # policy/members.json read + the reserved-slug set); neither module imports the other at top level.
+    from control_plane import workspace_membership as membership
+
+    rootp = Path(root).resolve()  # resolve up front so the traversal guard compares like-for-like (macOS /var→/private/var)
+    mounts: list[ActiveMount] = []
+    for entry in memberships:
+        ws_id = (entry.get("workspace_id") or "").strip() if isinstance(entry, dict) else ""
+        if not ws_id or ws_id == subject or ws_id.startswith(".") or ws_id in membership.RESERVED_SLUGS:
+            continue  # own baseline / reserved / dot-namespaced are never shared mounts
+        ws_dir = (rootp / ws_id).resolve()
+        if not ws_dir.exists() or rootp not in ws_dir.parents:
+            continue  # not materialized on this node, or a traversal attempt — skip, never raise
+        role = membership.is_member(rootp, ws_id, subject)  # AUTHORITATIVE (git), not the index copy
+        if role is None:
+            continue  # index is stale — the authoritative member list disagrees; do not mount
+        mounts.append(ActiveMount(
+            slug=ws_id,
+            repo=None,
+            ref=None,
+            role=SHARED_ROLE,
+            path=str(ws_dir),
+            write=role in ("contributor", "owner"),  # viewer = read-only; the write gate lands here
+            primary=False,  # a shared workspace is never the private baseline
+        ))
+    return mounts
+
+
 def activate_workspace(
     root: str | Path,
     subject: str,
@@ -426,6 +469,77 @@ def activate_workspace(
     )
     _save_state(store, state)
     return ActiveResult(subject, target_slug, changed=True, cloned=cloned, nested=nested)
+
+
+NEW_SLUG_PREFIX = "workspace"        # fresh blank workspaces get slugs workspace-1, workspace-2, …
+DEFAULT_NEW_NAME = "New workspace"   # …and this display name (New workspace, New workspace 2, …)
+
+
+def _unique_new_slug(state: dict) -> str:
+    """Mint a fresh, never-used slug for a brand-new blank workspace: ``workspace-<n>`` with ``n`` the
+    lowest positive integer whose slug isn't already a known slot (avoids colliding with a parked/active
+    workspace, the seed, or a repo slug). Deterministic and filesystem-safe."""
+    taken = set(state.get("slots", {})) | {SEED_SLOT, SEED_BACKUP_SLOT, _primary_slug(state)}
+    n = 1
+    while f"{NEW_SLUG_PREFIX}-{n}" in taken:
+        n += 1
+    return f"{NEW_SLUG_PREFIX}-{n}"
+
+
+def _unique_new_name(state: dict, base: str = DEFAULT_NEW_NAME) -> str:
+    """A display name not already used by another slot: ``New workspace``, then ``New workspace 2``, …
+    Keeps the list readable when several blanks are created (labels are only cosmetic, so a soft-unique
+    default is enough — a user rename always wins)."""
+    names = {slot.get("name") for slot in state.get("slots", {}).values() if slot.get("name")}
+    if base not in names:
+        return base
+    n = 2
+    while f"{base} {n}" in names:
+        n += 1
+    return f"{base} {n}"
+
+
+def create_workspace(
+    root: str | Path,
+    subject: str,
+    *,
+    name: Optional[str] = None,
+) -> ActiveResult:
+    """CREATE a brand-new BLANK workspace, seeded from the validated template, at a fresh unique slug and
+    ADD it to the subject's active set (the additive-model counterpart of "start fresh" — WP-A1).
+
+    This is NOT a swap: the private baseline (``<root>/<subject>``) and every other active workspace are
+    left completely untouched — nothing is parked, rebuilt, or backed up. The new workspace is materialized
+    in its own store slot (``<root>/.attached/<subject>/<slug>``), git-initialized + seed-committed by the
+    single seeding primitive, given a display name (``name`` if provided, else a unique "New workspace"),
+    and marked active. Returns its slug (``ActiveResult.changed`` is always True — a create is never a no-op).
+    """
+    rootp = Path(root)
+    _safe_subject_dir(rootp, subject)
+    store = _store(rootp, subject)
+    state = _load_state(store)
+
+    target_slug = _unique_new_slug(state)
+    slot_dir = store / target_slug
+
+    # Materialize OUT OF PLACE, then move into the slot — a seeding failure leaves the active set untouched
+    # (mirrors activate's phase discipline). The seed primitive git-inits + commits the fresh tree.
+    staged = store / f".staging-{target_slug}"
+    if staged.exists():
+        shutil.rmtree(staged)
+    _reseed(staged)
+    slot_dir.parent.mkdir(parents=True, exist_ok=True)
+    if slot_dir.exists():
+        shutil.rmtree(slot_dir)
+    shutil.move(str(staged), str(slot_dir))
+
+    slot = {"repo": None, "ref": None, "name": (name or "").strip()[:80] or _unique_new_name(state)}
+    state["slots"][target_slug] = slot
+    state["active_set"] = _normalized_active_set(
+        {**state, "active_set": [*state.get("active_set", []), target_slug]}
+    )
+    _save_state(store, state)
+    return ActiveResult(subject, target_slug, changed=True, cloned=False)
 
 
 def deactivate_workspace(root: str | Path, subject: str, slug: str) -> ActiveResult:

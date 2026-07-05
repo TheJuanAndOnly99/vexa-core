@@ -41,8 +41,10 @@ from control_plane.workspace_attach import (
     activate_workspace,
     active_workspaces,
     attached_workspaces,
+    create_workspace,
     deactivate_workspace,
     rename_workspace,
+    shared_active_mounts,
     swap_workspace,
 )
 from control_plane.workspace_publish import PublishError, RepoExistsError, publish_workspace, published_remote_url
@@ -290,6 +292,14 @@ class WorkspaceActivateBody(BaseModel):
     ref: Optional[str] = None    # branch/tag/sha (defaults to main)
     slug: Optional[str] = None   # activate an already-parked slot directly (no repo needed)
     token: Optional[str] = None  # access token for a PRIVATE repo — clone only, never stored (P15)
+
+
+class WorkspaceNewBody(BaseModel):
+    """CREATE a brand-new BLANK workspace (seeded from the template) at a fresh slug and ADD it to the
+    active set — the additive-model "new workspace" action. NOT a swap: nothing is parked/rebuilt/backed
+    up. ``name`` (optional) → the new workspace's display label (default a unique "New workspace")."""
+    model_config = {"extra": "forbid"}
+    name: Optional[str] = None
 
 
 class WorkspaceDeactivateBody(BaseModel):
@@ -850,9 +860,25 @@ def create_app(
         workload_id = dispatcher.dispatch(invocation)
         return {"workload_id": workload_id, "trigger": invocation["trigger"]}
 
+    def _read_target(request: Request, slug: Optional[str]) -> str:
+        """Resolve which workspace a READ (tree/file) targets. Default = the caller's own subject. A `slug`
+        addresses another workspace at the store root — allowed ONLY for a SHARED workspace the caller is a
+        member of (authoritative policy/members.json check via is_member). Lane A: this is what lets the
+        KNOWLEDGE panel read a shared mount's tree/files without leaking arbitrary workspaces by slug."""
+        subject = subject_of(request)
+        target = (slug or "").strip()
+        if not target or target == subject:
+            return subject
+        if membership_mod.is_member(wsr.root, target, subject) is None:
+            raise HTTPException(status_code=403, detail="not a member of this workspace")
+        return target
+
     @app.get("/api/workspace/tree")
-    def ws_tree(request: Request, hidden: bool = False):
-        return {"files": wsr.tree(subject_of(request), hidden=hidden)}
+    def ws_tree(request: Request, hidden: bool = False, slug: Optional[str] = None):
+        try:
+            return {"files": wsr.tree(_read_target(request, slug), hidden=hidden)}
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid subject")
 
     @app.post("/api/workspace/upload")
     async def ws_upload(request: Request, files: list[UploadFile] = File(...)):
@@ -887,10 +913,9 @@ def create_app(
         return {"files": uploaded}
 
     @app.get("/api/workspace/file")
-    def ws_file(request: Request, path: str):
-        subject = subject_of(request)
+    def ws_file(request: Request, path: str, slug: Optional[str] = None):
         try:
-            content = wsr.read(subject, path)
+            content = wsr.read(_read_target(request, slug), path)
         except ValueError:
             raise HTTPException(status_code=400, detail="invalid path")
         if content is None:
@@ -983,6 +1008,13 @@ def create_app(
             mounts = active_workspaces(wsr.root, subject)
         except ValueError:
             raise HTTPException(status_code=400, detail="invalid subject")
+        # Lane A: append the SHARED workspaces the subject is a member of. The index (users.data.memberships[])
+        # only ENUMERATES candidates; shared_active_mounts re-checks the role authoritatively per workspace.
+        # A failing index costs the "shared" section of the set, never the subject's own private mounts.
+        try:
+            mounts = mounts + shared_active_mounts(wsr.root, subject, mindex.list(subject))
+        except Exception:  # noqa: BLE001 — a shared-mount resolution hiccup must not break the active-set read
+            logger.warning("shared-mount resolution failed for subject=%s — returning private mounts only", subject)
         return {
             "subject": subject,
             "active": [
@@ -1008,6 +1040,19 @@ def create_app(
             raise HTTPException(status_code=502, detail=f"git clone failed: {exc}")
         return {"subject": result.subject, "slug": result.slug, "changed": result.changed,
                 "cloned": result.cloned, "nested": result.nested}
+
+    @app.post("/api/workspace/new", status_code=201)
+    def ws_new(request: Request, body: WorkspaceNewBody = Body(default=WorkspaceNewBody())):
+        """CREATE a brand-new BLANK workspace (seeded from the template) at a fresh unique slug and ADD it
+        to the active set (additive — the "new workspace" action). Nothing is parked/rebuilt/backed up: the
+        private baseline and every other active workspace stay exactly as they were."""
+        subject = subject_of(request)
+        try:
+            result = create_workspace(wsr.root, subject, name=body.name or None)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid subject")
+        return {"subject": result.subject, "slug": result.slug, "changed": result.changed,
+                "added": True}
 
     @app.post("/api/workspace/deactivate")
     def ws_deactivate(request: Request, body: WorkspaceDeactivateBody = Body(...)):
@@ -1337,7 +1382,6 @@ def _build_production_app() -> FastAPI:
     runtime = RuntimeHttpClient(settings.runtime_api_url)
     scheduler = SchedulerHttpClient(settings.runtime_api_url)
     identity = LocalIdentityMinter(settings.dispatch_signing_key.get_secret_value())
-    dispatcher = Dispatcher(settings, runtime, identity)
     invocations_url = settings.agent_api_self_url.rstrip("/") + "/invocations"
     # Lane M: the membership index mirror (users.data.memberships[]) over the admin-api internal edge.
     # Empty admin_api_url → the in-memory index (git files stay authoritative; only "shared with me"
@@ -1347,6 +1391,9 @@ def _build_production_app() -> FastAPI:
         membership_index = AdminApiMembershipIndex(
             settings.admin_api_url, settings.internal_api_secret.get_secret_value(),
         )
+    # Lane A: the Dispatcher takes the SAME index so shared workspaces the subject is a member of enter
+    # the dispatch mount set (read-only for Slice 1), not just the /active listing.
+    dispatcher = Dispatcher(settings, runtime, identity, membership_index=membership_index)
     app = create_app(
         dispatcher,
         stream_reader=RedisStreamReader(settings.redis_url),
