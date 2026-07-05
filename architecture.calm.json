@@ -638,6 +638,18 @@
       ]
     },
     {
+      "unique-id": "config.v1",
+      "node-type": "contract",
+      "name": "config.v1",
+      "description": "config.v1 \u2014 sealed/published contract (deploy): per-service deployment-config declaration (required-explicit / defaulted / capability tri-state + live probes), preflight + gate:config-contract (ADR-0026)",
+      "metadata": [
+        {
+          "path": "deploy/contracts/config.v1",
+          "domain": "deploy"
+        }
+      ]
+    },
+    {
       "unique-id": "slim",
       "node-type": "webclient",
       "name": "slim",
@@ -2046,7 +2058,8 @@
         "composed-of": {
           "container": "deploy",
           "nodes": [
-            "execution-targets.v1"
+            "execution-targets.v1",
+            "config.v1"
           ]
         }
       }
