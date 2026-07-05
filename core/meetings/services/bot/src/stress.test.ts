@@ -68,7 +68,6 @@ async function main(): Promise<void> {
       },
       onRemoval() { return () => { /* */ }; },
       async leave() { /* */ },
-      async withdraw() { /* */ },
     };
     const o = createOrchestrator(inv(), {
       lifecycle: lc, join: floodJoin, pipeline: noopPipeline(), acts: leavesOnSubscribe(1),
@@ -89,7 +88,6 @@ async function main(): Promise<void> {
       async join(report) { await report('active'); return 'admitted' as JoinOutcome; },
       onRemoval() { return () => { /* */ }; },
       async leave() { left = true; },
-      async withdraw() { /* */ },
     };
     const o = createOrchestrator(inv(), { lifecycle: lc, join, pipeline: failingPipeline, acts: noActs });
     const res = await o.run();
@@ -110,7 +108,6 @@ function mockJoin(outcome: JoinOutcome): JoinDriver {
     async join(report) { await report('awaiting_admission'); if (outcome === 'admitted') await report('active'); return outcome; },
     onRemoval() { return () => { /* */ }; },
     async leave() { /* */ },
-    async withdraw() { /* */ },
   };
 }
 

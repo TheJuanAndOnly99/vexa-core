@@ -56,7 +56,6 @@ function noBrowserJoinDriver(reason: string): JoinDriver {
     async join() { console.error(`[bot] no browser session: ${reason}`); return 'error'; },
     onRemoval() { return () => { /* */ }; },
     async leave() { /* */ },
-    async withdraw() { /* no browser — nothing to withdraw */ },
   };
 }
 
