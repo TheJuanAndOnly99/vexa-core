@@ -399,15 +399,8 @@ def create_app(
     @app.get("/health")
     def health():
         ok = dispatcher is not None
-        # ADDITIVE config.v1 rows (ADR-0026): the agent plane's capability tri-states (bot_gateway ·
-        # model_inference). They never affect `status`/`checks` or the status code — an unconfigured
-        # capability degrades a FEATURE (e.g. 'add bot from URL', worker model credentials), not the
-        # process; the runtime's /health carries the credentials-file probe for the mount mechanics.
-        from control_plane.config_preflight import capability_health
-
         return JSONResponse(
-            {"status": "ok" if ok else "degraded", "service": "agent-api", "checks": {"dispatcher": ok},
-             "capabilities": capability_health()},
+            {"status": "ok" if ok else "degraded", "service": "agent-api", "checks": {"dispatcher": ok}},
             status_code=200 if ok else 503,
         )
 
@@ -507,13 +500,22 @@ def create_app(
             cursor = None
         # Gap-fill from the cursor (last cleaned raw id); no cursor yet ⇒ from the start of the transcript.
         start_id = cursor or "0-0"
+        meeting_ref: dict = {
+            "meeting_id": body.native_id, "session_uid": body.native_id,
+            "platform": body.platform, "transcript_start_id": start_id,
+        }
+        # Key the copilot's processed-notes stream by the meetings-domain ROW id when the watcher has
+        # already registered it on the live entry (it learns it from the segments' numeric meeting_id).
+        # The row id is unique per meeting run — a re-sent bot on the same native link never
+        # mixes/clobbers a previous meeting's processed doc — and the meeting-api db-writer drains
+        # proc:meeting:{numeric} into the meeting row's data JSONB (the durable processed doc).
+        live_entry = next((m for m in live.list() if m.get("session_uid") == body.native_id), None)
+        if live_entry and live_entry.get("numeric_meeting_id"):
+            meeting_ref["numeric_meeting_id"] = str(live_entry["numeric_meeting_id"])
         inv = units.make_dispatch(
             subject=subject_of(request), trigger="transcription",
             start=units.entrypoint(inline=_MEETING_BRIEF),
-            context={"kind": "meeting", "meeting": {
-                "meeting_id": body.native_id, "session_uid": body.native_id,
-                "platform": body.platform, "transcript_start_id": start_id,
-            }},
+            context={"kind": "meeting", "meeting": meeting_ref},
         )
         dispatcher.dispatch(inv)
         return {"native_id": body.native_id, "processing": True, "resumed_from": start_id}
@@ -891,14 +893,7 @@ def create_app(
 def _build_production_app() -> FastAPI:
     from shared.adapters import LocalIdentityMinter, RedisStreamReader, RuntimeHttpClient, SchedulerHttpClient
     from shared.config import load_settings
-    from control_plane.config_preflight import preflight
     from control_plane.workspace_routines import start_workspace_routine_reconciler
-
-    # config.v1 boot preflight (ADR-0026): agent-api has no required-explicit keys today, so this
-    # logs the capability tri-states (bot_gateway · model_inference) — a deploy that cannot add bots
-    # from URL or whose workers will have NO model credentials says so in the boot log and on
-    # /health, instead of failing at first chat with 'Model inference failed: Not logged in'.
-    preflight()
 
     settings = load_settings()
     runtime = RuntimeHttpClient(settings.runtime_api_url)
