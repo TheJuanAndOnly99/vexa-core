@@ -78,10 +78,6 @@ function MeetingCanvasBody({ meetingId }: { meetingId?: string }) {
   const { meeting, transcript } = useMeeting();
   const live = meeting.live === true;
   const hasNotes = (transcript.notes?.length ?? 0) > 0;
-  // P0: `meetingId` (the tab id) is the meetings-domain ROW id; the human-readable native is on the
-  // meeting state — pass BOTH to /api/meeting/process so it keys the copilot on the row id (leak-safe)
-  // while naming the kg doc by the native.
-  const nativeId = meeting.nativeId;
 
   // null = untouched → follow the default (which can flip once the durable notes hydrate).
   const [override, setOverride] = useState<boolean | null>(null);
@@ -96,8 +92,7 @@ function MeetingCanvasBody({ meetingId }: { meetingId?: string }) {
     if (meetingId && live) {
       void fetch("/api/meeting/process", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        // meeting_id = the ROW id (the copilot keys on it); native_id = the display native (kg doc name).
-        body: JSON.stringify({ meeting_id: meetingId, native_id: nativeId ?? meetingId, on: next }),
+        body: JSON.stringify({ native_id: meetingId, on: next }),
       }).catch(() => { /* best-effort — the view still reflects the toggle */ });
     }
   };
