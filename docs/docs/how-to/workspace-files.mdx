@@ -3,35 +3,35 @@ title: "Browse, upload, and swap the workspace"
 description: "Read the knowledge base over the API, add documents, or attach your own git repo."
 ---
 
-The [workspace](/concepts#workspace) is a git folder of Markdown — knowledge, plans, and the agent's
-session, all just files. The knowledge itself follows an open standard
-([OKF](#the-knowledge-graph-is-an-okf-bundle), below). Every workspace route derives your identity from the
-API key; you never pass a subject.
+The [workspace](/concepts#workspace) is a git folder of Markdown — knowledge and plans, all just files. The knowledge itself follows an open standard ([OKF](#the-knowledge-graph-is-an-okf-bundle), below). Every workspace route derives your identity from the API key; you never pass a subject.
+
+You can have **many workspaces** — your Personal one, ones you created, ones shared with you — all equal-rank. The **active set** (the ones you have switched on) decides what agents mount and what the client shows; reads are addressed by each workspace's `slug`.
 
 ## Browse and read
 
 ```bash
-# the file tree
-curl -H "X-API-Key: $API_KEY" "$API_BASE/agent/workspace/tree"
+# your ACTIVE SET — the workspaces currently switched on, in mount order
+curl -H "X-API-Key: $API_KEY" "$API_BASE/agent/workspace/active"
+# → { "subject": "...", "active": [ { "slug": "...", "role": "...", "write": true, ... } ] }
+
+# a workspace's file tree (slug from the active set; omitting slug is a deprecated
+# legacy form — always address a workspace explicitly)
+curl -H "X-API-Key: $API_KEY" "$API_BASE/agent/workspace/tree?slug=<slug>"
 # → { "files": ["kg/entities/acme.md", "meetings/2026-06-29-acme.md", ...] }
 
 # one file's content (404 if absent)
-curl -H "X-API-Key: $API_KEY" "$API_BASE/agent/workspace/file?path=kg/entities/acme.md"
+curl -H "X-API-Key: $API_KEY" "$API_BASE/agent/workspace/file?path=kg/entities/acme.md&slug=<slug>"
 # → { "path": "...", "content": "..." }
 
 # git state — branch, uncommitted changes, recent commits
-curl -H "X-API-Key: $API_KEY" "$API_BASE/agent/workspace/git"
+curl -H "X-API-Key: $API_KEY" "$API_BASE/agent/workspace/git?slug=<slug>"
 ```
 
-Pass `hidden=true` to `tree` to include dotfiles. `git` is the durable state and the undo — every agent
-write is a commit.
+Pass `hidden=true` to `tree` to include dotfiles. `git` is the durable state and the undo — every agent write is a commit.
 
 ## The knowledge graph is an OKF bundle
 
-The `kg/` subtree follows the
-[Open Knowledge Format](https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf) (OKF)
-v0.1 — Google's open, vendor-neutral standard for markdown knowledge. Each entity is one file at
-`kg/entities/<type>/<slug>.md` with YAML frontmatter:
+The `kg/` subtree follows the [Open Knowledge Format](https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf) (OKF) v0.1 — Google's open, vendor-neutral standard for markdown knowledge. Each entity is one file at `kg/entities/<type>/<slug>.md` with YAML frontmatter:
 
 ```markdown
 ---
@@ -48,21 +48,14 @@ Body is plain markdown. Entities cross-reference each other with [[wikilinks]]
 by title — the knowledge graph emerges from the links.
 ```
 
-Vexum's frontmatter contract (`type`/`id`/`title` required, per the
-[`workspace.v1` schema](https://github.com/Vexa-ai/vexa-core/blob/main/core/agent/contracts/workspace.v1/workspace.schema.json))
-is a strict superset of OKF, which requires only `type` — so every workspace is a conformant bundle any
-OKF consumer can read, and `[[wikilinks]]` are a tolerated extension.
+Vexum's frontmatter contract (`type`/`id`/`title` required, per the [`workspace.v1` schema](https://github.com/Vexa-ai/vexa-core/blob/main/core/agent/contracts/workspace.v1/workspace.schema.json)) is a strict superset of OKF, which requires only `type` — so every workspace is a conformant bundle any OKF consumer can read, and `[[wikilinks]]` are a tolerated extension.
 
 Two **reserved filenames** carry no frontmatter and are not entities:
 
-- `index.md` — a per-directory listing (`- [Title](file.md) — description`) for progressive
-  disclosure; seeded workspaces ship them generated, and the agent maintains them as entities are
-  added or removed.
+- `index.md` — a per-directory listing (`- [Title](file.md) — description`) for progressive disclosure; seeded workspaces ship them generated, and the agent maintains them as entities are added or removed.
 - `log.md` — optional change history, newest first, grouped under `## YYYY-MM-DD` headings.
 
-Because the bundle is just files in git, it is portable by construction: `tree` + `file` above read it
-over the API, and a `git clone` (or the swap endpoint below) moves the whole knowledge base between
-tools — nothing about it is Vexum-specific.
+Because the bundle is just files in git, it is portable by construction: `tree` \+ `file` above read it over the API, and a `git clone` (or the swap endpoint below) moves the whole knowledge base between tools — nothing about it is Vexum-specific.
 
 ## Upload documents
 
@@ -84,9 +77,15 @@ curl -X POST "$API_BASE/agent/workspace/init" -H "X-API-Key: $API_KEY"
 # → 201 { "workspace": "...", "seeded": true, "already_initialized": false }
 ```
 
-## Attach your own git repo
+## Multiple workspaces — activate, attach, share
 
-Swap in an external git repo as the active workspace — the current one is **parked**, not lost:
+Workspaces are **flat and equal-rank** — Personal included. Activation is **additive**: switching a workspace on mounts it _alongside_ the others, switching it off removes its files from the client and the agent's next turn. The first active workspace is the agent's working directory.
+
+A workspace can be **shared**: mint an invite, the other person accepts, and it appears in their workspace list with a per-member role — their agents mount it alongside their own workspaces, and each member's writes commit under their own identity. In the terminal, the workspace **manage panel** covers members, invites, GitHub push/pull, and the workspace's purpose. Private chat history never rides along — conversations live in each member's private `_system` tier, not in the workspace.
+
+### Attach your own git repo
+
+Swap in an external git repo as a workspace — the current one is **parked**, not lost:
 
 ```bash
 curl -X POST "$API_BASE/agent/workspace/swap" \
@@ -103,5 +102,4 @@ curl -H "X-API-Key: $API_KEY" "$API_BASE/agent/workspace/attached"
 
 ## Next
 
-Put an agent to work on what's here — [chat with the workspace](/how-to/chat-workspace) or run an
-[unattended routine](/how-to/daily-brief) over it.
+Put an agent to work on what's here — [chat with the workspace](/how-to/chat-workspace) or run an [unattended routine](/how-to/daily-brief) over it.
