@@ -3,10 +3,9 @@ title: "Chat with your workspace"
 description: "Ask an agent that has your whole knowledge base as context — and let it record what you decide."
 ---
 
-**Chat** is a [dispatch](/core/agents) fired *now*: you send a message, an
-agent works your [workspace](/concepts#workspace) — every meeting, email, and note already compiled there
-— and answers, streaming back live. This is not retrieval over a document store; the workspace is a
-maintained Markdown knowledge base the agent reads and edits like a developer in a repo.
+**Chat** is a [dispatch](/core/agents) fired _now_: you send a message, an agent works your **active workspaces** — every meeting, email, and note already compiled there — and answers, streaming back live. This is not retrieval over a document store; each workspace is a maintained Markdown knowledge base the agent reads and edits like a developer in a repo.
+
+In the terminal, replies are **connected to the knowledge**: entity mentions render as `[[Title]]` chips and workspace file references as links — click any of them to open the doc, resolved across all active workspaces. Conversation history is private: it lives in your `_system` tier, never inside a (possibly shared) workspace.
 
 ## Ask a question
 
@@ -21,7 +20,7 @@ curl -N -X POST "$API_BASE/agent/chat" \
 Each `data:` line is one frame:
 
 | frame | fields | meaning |
-|---|---|---|
+| --- | --- | --- |
 | `message-delta` | `text` | a chunk of the streamed reply |
 | `tool-call` | `tool`, `args`, `callId` | the agent invoked a tool |
 | `tool-result` | `callId`, `ok`, `summary` | that tool returned |
@@ -31,8 +30,7 @@ Each `data:` line is one frame:
 
 ## Record a decision (trusted write)
 
-Because input from you is **trusted**, the same agent can write — record a decision, update an entity,
-draft a doc. Just ask:
+Because input from you is **trusted**, the same agent can write — record a decision, update an entity, draft a doc. Just ask:
 
 ```bash
 curl -N -X POST "$API_BASE/agent/chat" \
@@ -59,18 +57,14 @@ curl -H "X-API-Key: $API_KEY" "$API_BASE/agent/sessions/<id>/history"
 
 ## Build a cross-source briefing
 
-The agent grounds its answer in everything the workspace holds, so you can ask it to pull a topic together
-across past meetings and emails:
+The agent grounds its answer in everything the workspace holds, so you can ask it to pull a topic together across past meetings and emails:
 
 ```bash
 -d '{"prompt":"Brief me on the Acme account: every meeting and email, the open decisions, and the next step."}'
 ```
 
-This is the **knowledge agent** pattern — the output is anchored in
-accumulated context, and each run leaves the workspace a little more complete.
+This is the **knowledge agent** pattern — the output is anchored in accumulated context, and each run leaves the workspace a little more complete.
 
 <Note>
-A `rejected` frame means governance blocked the write. Trusted chat may write; untrusted triggers (email,
-web) are propose-only — see [Governance](/architecture/governance) and
-[Troubleshooting](/troubleshooting#agent-write-was-rejected).
+  A `rejected` frame means governance blocked the write. Trusted chat may write; untrusted triggers (email, web) are propose-only — see [Governance](/architecture/governance) and [Troubleshooting](/troubleshooting#agent-write-was-rejected).
 </Note>
