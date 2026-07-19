@@ -1191,6 +1191,18 @@
           ]
         }
       }
+    },
+    {
+      "unique-id": "dashboard",
+      "node-type": "webclient",
+      "name": "dashboard (deprecated)",
+      "description": "dashboard \u2014 DEPRECATED 0.10 web client, shipped as an off-by-default compose/helm option while still load-bearing (#813): the multi-user UI hosted production runs against the 0.12 core via the gateway's hosted-compat surface. External pinned image (vexaai/dashboard), not built from this tree; versions on its own tag, never global.imageTag. Deprecation exit: deleted when the terminal covers the authenticated-session/browser-session flows.",
+      "metadata": [
+        {
+          "path": "deploy/compose",
+          "external-image": "vexaai/dashboard"
+        }
+      ]
     }
   ],
   "relationships": [
@@ -2128,6 +2140,36 @@
       },
       "description": "live WS via gateway",
       "protocol": "WebSocket"
+    },
+    {
+      "unique-id": "dash-gw-rest",
+      "description": "dashboard \u2192 gateway REST (hosted-compat aliases; the hosted-proven wiring)",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "dashboard"
+          },
+          "destination": {
+            "node": "gateway",
+            "interface": "gateway-rest"
+          }
+        }
+      }
+    },
+    {
+      "unique-id": "dash-gw-ws",
+      "description": "dashboard \u2192 gateway /ws (live transcript view)",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "dashboard"
+          },
+          "destination": {
+            "node": "gateway",
+            "interface": "gateway-ws"
+          }
+        }
+      }
     },
     {
       "unique-id": "slim-gw",
