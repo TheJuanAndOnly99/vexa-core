@@ -72,6 +72,8 @@ system runtime-system  # workload spawn (bot/agent containers)
   service runtime
 
 system deploy  # deployment + execution-target registry
+  contract execution-targets.v1
+  contract config.v1
 
 system platform  # shared infra backing the services
   service redis
