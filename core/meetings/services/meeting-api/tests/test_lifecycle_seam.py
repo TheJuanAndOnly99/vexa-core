@@ -608,16 +608,18 @@ def _set_updated_now(repo: InMemoryMeetingRepo, meeting_id: int) -> None:
     repo._meetings[meeting_id]["updated_at"] = datetime.now(timezone.utc).isoformat()
 
 
-def _run_general_sweep(client: TestClient, repo: InMemoryMeetingRepo, *, stop_grace=45.0, active_grace=300.0):
+def _run_general_sweep(client: TestClient, repo: InMemoryMeetingRepo, *, stop_grace=45.0,
+                       active_grace=300.0, preactive_grace=None):
     """Run ONE general sweep exactly as the loop does, posting through the live callback."""
     import logging
 
     async def _post(body: dict):
         return client.post(ENDPOINT, json=body).status_code
 
+    extra = {} if preactive_grace is None else {"preactive_grace": preactive_grace}
     return asyncio.run(reconcile_stale_nonterminal_sweep(
         repo, None, _post, stop_grace=stop_grace, active_grace=active_grace,
-        log=logging.getLogger("test.reconcile"),
+        log=logging.getLogger("test.reconcile"), **extra,
     ))
 
 
@@ -701,16 +703,18 @@ def test_general_reconcile_noop_on_terminal_rows():
 from meeting_api.bot_spawn.fakes import FakeRuntimeClient  # noqa: E402
 
 
-def _run_general_sweep_rt(client, repo, runtime, *, stop_grace=45.0, active_grace=300.0):
+def _run_general_sweep_rt(client, repo, runtime, *, stop_grace=45.0, active_grace=300.0,
+                          preactive_grace=None):
     """Run ONE general sweep with a real RuntimeClient injected (so the liveness gate is exercised)."""
     import logging
 
     async def _post(body: dict):
         return client.post(ENDPOINT, json=body).status_code
 
+    extra = {} if preactive_grace is None else {"preactive_grace": preactive_grace}
     return asyncio.run(reconcile_stale_nonterminal_sweep(
         repo, runtime, _post, stop_grace=stop_grace, active_grace=active_grace,
-        log=logging.getLogger("test.reconcile"),
+        log=logging.getLogger("test.reconcile"), **extra,
     ))
 
 
@@ -731,21 +735,24 @@ def test_quiet_but_live_active_not_reaped_even_past_grace():
     assert "wl-live" not in runtime.deleted  # the live bot's workload was NOT torn down
 
 
-def test_dead_active_workload_gone_is_reaped():
-    """An `active` meeting past the grace whose bot WORKLOAD IS GONE (runtime 404 → not tracked) IS
-    reaped to `completed` (the ujp-aqif-kmv convergence: a truly-dead active bot still completes)."""
+def test_untracked_active_workload_404_is_never_reaped():
+    """THE INCIDENT (defect B), FLIPPED FROM THE OLD ASSERTION: a runtime 404 is NOT evidence the
+    bot is gone — a recreated runtime (in-memory registry lost) 404s over a LIVE, capturing bot.
+    The old sweep completed the meeting on exactly this 404 (posted from 127.0.0.1, zero evidence:
+    no exit code, no bot callback) and orphaned the container. Now: the meeting stays `active`,
+    nothing is deleted, and the desync is loud in the logs. Evidence (a TRACKED terminal workload,
+    or the bot's own callback) still reaps — see the neighbouring tests."""
     repo = InMemoryMeetingRepo()
     m = _seed(repo, status="active")  # past the grace
-    repo._meetings[m["id"]]["bot_container_id"] = "wl-dead"
-    # Empty workload map → get_workload("wl-dead") returns None (404, gone).
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-untracked"
+    # Empty workload map → get_workload("wl-untracked") returns None (404: the kernel doesn't KNOW).
     runtime = FakeRuntimeClient(workloads={})
     client = TestClient(create_app(meeting_repo=repo))
 
     n = _run_general_sweep_rt(client, repo, runtime)
-    assert n == 1
-    assert repo._meetings[m["id"]]["status"] == "completed"
-    assert repo._meetings[m["id"]]["data"].get("completion_reason") == "left_alone"
-    assert "wl-dead" in runtime.deleted  # the orphan workload was torn down
+    assert n == 0, "a 404 must never advance the meeting to completed"
+    assert repo._meetings[m["id"]]["status"] == "active"
+    assert runtime.deleted == []
 
 
 def test_dead_active_terminal_workload_state_is_reaped():
@@ -797,3 +804,794 @@ def test_active_with_unknown_liveness_is_not_reaped():
     n = _run_general_sweep_rt(client, repo, runtime)
     assert n == 0
     assert repo._meetings[m["id"]]["status"] == "active"
+
+
+def test_stopping_with_untracked_workload_stays_stopping():
+    """Defect C in the general sweep: a `stopping` meeting whose workload the runtime 404s must NOT
+    complete — termination is UNCONFIRMED (a live container may be orphaned). It stays `stopping`
+    (truthful: the stop is not done), loud in the logs, retried next sweep — the re-adopting
+    runtime answers truthfully once booted."""
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status="stopping")
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-untracked"
+    repo._meetings[m["id"]]["data"]["stop_requested"] = True
+    runtime = FakeRuntimeClient(workloads={})   # post-recreate registry: knows nothing
+    client = TestClient(create_app(meeting_repo=repo))
+
+    n = _run_general_sweep_rt(client, repo, runtime)
+    assert n == 0
+    assert repo._meetings[m["id"]]["status"] == "stopping"
+    assert runtime.deleted == []
+
+
+def test_bot_callback_evidence_still_completes_during_runtime_desync():
+    """Evidence still advances the FSM even while the runtime registry is desynced: the sweep
+    refuses the 404 (no reap), but the bot's OWN terminal lifecycle callback — the primary
+    evidence — completes the meeting exactly as before."""
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status="active")
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-untracked"
+    runtime = FakeRuntimeClient(workloads={})
+    client = TestClient(create_app(meeting_repo=repo))
+
+    assert _run_general_sweep_rt(client, repo, runtime) == 0        # 404 → no reap
+    assert repo._meetings[m["id"]]["status"] == "active"
+
+    r = client.post(ENDPOINT, json={                                 # the bot's own evidence
+        "connection_id": "sess-uid", "status": "completed", "completion_reason": "left_alone",
+    })
+    assert r.status_code == 200
+    assert repo._meetings[m["id"]]["status"] == "completed"
+
+
+# ── bounded untracked escalation (the zombie-loop fix) ───────────────────────────────────────────
+# "Untracked, never reap" is right as a reflex but wrong as a steady state: on the process backend a
+# runtime restart kills the workers WITH the runtime (adopt() is a no-op, no callback will ever
+# come), so every meeting live across the restart would loop `untracked` + a dead DELETE at error
+# level every sweep, forever. The sweep now tracks CONTINUOUS untracked observations per meeting;
+# past the window (MEETING_UNTRACKED_GRACE_SEC) with no recovery the meeting advances to `failed`
+# carrying the evidence note. Recovery — runtime re-adoption OR a bot heartbeat/callback — resets
+# the window, so the escalation only ever fires on a genuinely lost workload.
+
+def _run_general_sweep_esc(client, repo, runtime, tracker, *, untracked_grace,
+                           stop_grace=45.0, active_grace=300.0):
+    """One general sweep with an INJECTED untracked-tracker + escalation window."""
+    import logging
+
+    async def _post_cb(body: dict):
+        return client.post(ENDPOINT, json=body).status_code
+
+    return asyncio.run(reconcile_stale_nonterminal_sweep(
+        repo, runtime, _post_cb, stop_grace=stop_grace, active_grace=active_grace,
+        log=logging.getLogger("test.reconcile"),
+        untracked_grace=untracked_grace, untracked_since=tracker,
+    ))
+
+
+def _make_stale(repo, meeting_id) -> None:
+    """Push a row's updated_at far into the past (quiet past any grace window)."""
+    repo._meetings[meeting_id]["updated_at"] = "2026-06-20T00:00:00+00:00"
+
+
+def test_untracked_blip_does_not_escalate():
+    """A SHORT untracked blip (runtime restarting) must NOT escalate: the runtime re-adopts the
+    workload, the probe answers alive again, and the window resets — even with a zero grace."""
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status="active")
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-blip"
+    runtime = FakeRuntimeClient(workloads={})          # runtime just restarted: knows nothing
+    client = TestClient(create_app(meeting_repo=repo))
+    tracker: dict = {}
+
+    assert _run_general_sweep_esc(client, repo, runtime, tracker, untracked_grace=0.0) == 0
+    assert repo._meetings[m["id"]]["status"] == "active"   # first observation only opens the window
+    assert m["id"] in tracker
+
+    # The runtime finishes booting and RE-ADOPTS the live bot — the probe answers alive again.
+    runtime._workloads["wl-blip"] = {"workloadId": "wl-blip", "state": "running"}
+    assert _run_general_sweep_esc(client, repo, runtime, tracker, untracked_grace=0.0) == 0
+    assert repo._meetings[m["id"]]["status"] == "active"
+    assert tracker == {}, "recovery must reset the untracked window"
+
+    # A LATER desync starts a FRESH window — the old blip never counts toward it.
+    runtime._workloads.pop("wl-blip")
+    assert _run_general_sweep_esc(client, repo, runtime, tracker, untracked_grace=0.0) == 0
+    assert repo._meetings[m["id"]]["status"] == "active"
+
+
+def test_continuous_untracked_past_window_escalates_once_with_evidence():
+    """CONTINUOUS untracked past the window (runtime restart on the process backend: the workers
+    died with it, no callback will ever come) escalates the meeting to `failed` EXACTLY ONCE, with
+    the evidence note recorded on the transition — and the 15s error/DELETE loop stops (the
+    terminal row leaves the sweep's listing)."""
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status="active")
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-lost"
+    runtime = FakeRuntimeClient(workloads={})          # untracked forever — nothing will re-adopt
+    client = TestClient(create_app(meeting_repo=repo))
+    tracker: dict = {}
+
+    assert _run_general_sweep_esc(client, repo, runtime, tracker, untracked_grace=0.0) == 0
+    assert repo._meetings[m["id"]]["status"] == "active"   # window opened, not yet elapsed
+
+    n = _run_general_sweep_esc(client, repo, runtime, tracker, untracked_grace=0.0)
+    assert n == 1, "continuous untracked past the window must escalate"
+    assert repo._meetings[m["id"]]["status"] == "failed"
+    assert runtime.deleted == []                            # nothing was blindly torn down
+    assert tracker == {}
+    # The evidence note rides the transition: what was unaccountable, and the policy applied.
+    data = repo._meetings[m["id"]]["data"]
+    trail = data.get("status_transition", [])
+    assert any("presumed lost" in (t.get("reason") or "") for t in trail), trail
+
+    # Exactly once: the terminal row is no longer listed — the loop has converged.
+    assert _run_general_sweep_esc(client, repo, runtime, tracker, untracked_grace=0.0) == 0
+    assert repo._meetings[m["id"]]["status"] == "failed"
+
+
+def test_stopping_untracked_past_window_escalates_too():
+    """The `stopping` zombie (user pressed Stop, then the runtime restarted on the process backend):
+    the teardown stays unconfirmable (404) forever — past the window it converges to `failed`
+    instead of retrying the dead DELETE every sweep for eternity."""
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status="stopping")
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-gone"
+    repo._meetings[m["id"]]["data"]["stop_requested"] = True
+    runtime = FakeRuntimeClient(workloads={})
+    client = TestClient(create_app(meeting_repo=repo))
+    tracker: dict = {}
+
+    assert _run_general_sweep_esc(client, repo, runtime, tracker, untracked_grace=0.0) == 0
+    assert repo._meetings[m["id"]]["status"] == "stopping"  # window opened
+
+    assert _run_general_sweep_esc(client, repo, runtime, tracker, untracked_grace=0.0) == 1
+    assert repo._meetings[m["id"]]["status"] == "failed"
+    assert runtime.deleted == []
+
+
+def test_bot_callback_mid_window_cancels_escalation():
+    """A sign of life mid-window — the bot's callback/heartbeat bumping the row — cancels the
+    escalation: the row leaves the stale listing, the window resets, and a LATER quiet spell starts
+    from zero. The meeting is never failed under a live bot."""
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status="active")
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-alive"
+    runtime = FakeRuntimeClient(workloads={})
+    client = TestClient(create_app(meeting_repo=repo))
+    tracker: dict = {}
+
+    assert _run_general_sweep_esc(client, repo, runtime, tracker, untracked_grace=0.0) == 0
+    assert m["id"] in tracker                               # window opened
+
+    # Mid-window the bot proves it is alive (its callback/heartbeat bumps the row's updated_at —
+    # exactly what the receiver's persist does): the row is no longer stale.
+    _set_updated_now(repo, m["id"])
+    assert _run_general_sweep_esc(client, repo, runtime, tracker, untracked_grace=0.0) == 0
+    assert tracker == {}, "a bot sign-of-life must cancel the pending escalation"
+    assert repo._meetings[m["id"]]["status"] == "active"
+
+    # The meeting goes quiet again LATER, still untracked: a fresh window — no instant escalation
+    # from the stale pre-callback observation.
+    _make_stale(repo, m["id"])
+    assert _run_general_sweep_esc(client, repo, runtime, tracker, untracked_grace=0.0) == 0
+    assert repo._meetings[m["id"]]["status"] == "active"
+
+
+# ── Bug 1: runtime `destroyed` callback for a `stopping` meeting is TERMINAL EVIDENCE ────────────
+# The reaper-loop incident: DELETE /bots → runtime deletes the workload (DELETE /workloads/{id} →
+# 200) and posts a runtime callback with state=destroyed — but meeting-api NEVER advanced the meeting
+# out of `stopping`. It re-logged `runtime_callback ... destroyed` and re-issued DELETE (now 404)
+# every ~15s FOREVER. The runtime's confirmed destroy IS terminal evidence (#50's principle: real
+# evidence, not a bare 404) → advance the meeting: `completed` if it ever reached active (`stopping`/
+# `active`/`needs_help`), `failed` if it never did (pre-active). The /runtime/callback route consumes
+# it via synthesize_terminal_for_dead_workload, driven through the bot's OWN lifecycle callback (POST
+# to /bots/internal/callback/lifecycle — exercised in-process here, like _run_general_sweep_rt).
+
+from meeting_api.lifecycle.reconcile import synthesize_terminal_for_dead_workload  # noqa: E402
+
+
+def _consume_runtime_terminal(client, repo, workload_id, state):
+    """Drive synthesize_terminal_for_dead_workload with the bot's OWN lifecycle callback wired to the
+    in-process FSM endpoint (the prod _drive_terminal POSTs to 127.0.0.1:PORT, unreachable under the
+    TestClient — so we inject the client.post here, exactly as the reconcile-sweep tests do)."""
+    import logging
+
+    async def _drive(body: dict):
+        return client.post(ENDPOINT, json=body).status_code
+
+    return asyncio.run(synthesize_terminal_for_dead_workload(
+        repo, workload_id, state, _drive, log=logging.getLogger("test.runtime-cb"),
+    ))
+
+
+def test_runtime_destroyed_completes_stopping_meeting_and_stops_reaper():
+    """A `stopping` meeting whose workload the runtime confirms `destroyed` (its bot never sent its own
+    terminal callback — e.g. SIGKILLed at teardown) advances to `completed` on that evidence. On the
+    PRE-FIX code this FAILED: the runtime callback only handled pre-active rows, so the meeting stayed
+    `stopping` and the stop-reconcile sweep re-DELETEd forever. Once terminal it leaves the stale-
+    stopping listing → the reaper loop stops."""
+    repo = _ReconcileRepo()
+    m = _seed(repo, status="stopping")
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-stop"
+    client = TestClient(create_app(meeting_repo=repo))
+
+    # The reaper WOULD list this meeting while it is `stopping` …
+    assert repo.list_stale_stopping_sync() == [(m["id"], "sess-uid", "wl-stop")]
+
+    # … until the runtime's destroy evidence advances it out of `stopping`.
+    assert _consume_runtime_terminal(client, repo, "wl-stop", "destroyed") is True
+    assert repo._meetings[m["id"]]["status"] == "completed"
+    assert repo._meetings[m["id"]]["data"].get("completion_reason") == "stopped"
+
+    # Reaper loop stops: a completed row is no longer stale-stopping.
+    assert repo.list_stale_stopping_sync() == []
+
+
+def test_runtime_destroyed_completes_active_meeting():
+    """An `active` meeting whose workload is runtime-confirmed `destroyed` WITHOUT its own terminal
+    callback (killed before it could POST `completed`) also completes — it reached active, so
+    `completed` (reason left_alone: the workload simply vanished while live)."""
+    repo = _ReconcileRepo()
+    m = _seed(repo, status="active")
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-act"
+    client = TestClient(create_app(meeting_repo=repo))
+
+    assert _consume_runtime_terminal(client, repo, "wl-act", "destroyed") is True
+    assert repo._meetings[m["id"]]["status"] == "completed"
+    assert repo._meetings[m["id"]]["data"].get("completion_reason") == "left_alone"
+
+
+def test_runtime_exited_also_completes_stopping():
+    """`exited` is terminal evidence too (not just `destroyed`) — the runtime reports the workload gone."""
+    repo = _ReconcileRepo()
+    m = _seed(repo, status="stopping")
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-exit"
+    client = TestClient(create_app(meeting_repo=repo))
+
+    assert _consume_runtime_terminal(client, repo, "wl-exit", "exited") is True
+    assert repo._meetings[m["id"]]["status"] == "completed"
+
+
+def test_runtime_destroyed_fails_pre_active_meeting():
+    """Distinguish never-active from was-active: a PRE-ACTIVE row (`awaiting_admission` — killed in the
+    waiting room before it could report active) → `failed`, not `completed` (CC5 preserved)."""
+    repo = _ReconcileRepo()
+    m = _seed(repo, status="awaiting_admission")
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-wait"
+    client = TestClient(create_app(meeting_repo=repo))
+
+    assert _consume_runtime_terminal(client, repo, "wl-wait", "destroyed") is True
+    assert repo._meetings[m["id"]]["status"] == "failed"
+    assert repo._meetings[m["id"]]["data"].get("failure_stage") == "awaiting_admission"
+
+
+def test_runtime_destroyed_noop_on_already_terminal_meeting():
+    """A normal teardown destroys the workload AFTER the bot's own `completed` already landed — the
+    runtime callback must be a no-op there (never re-open or re-fail a terminal meeting)."""
+    repo = _ReconcileRepo()
+    m = _seed(repo, status="active")
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-done"
+    client = TestClient(create_app(meeting_repo=repo))
+    # The bot completes it itself first.
+    client.post(ENDPOINT, json={"connection_id": "sess-uid", "status": "completed",
+                                "completion_reason": "left_alone"})
+    assert repo._meetings[m["id"]]["status"] == "completed"
+
+    # The trailing runtime destroy is a no-op (stays completed, drives nothing).
+    assert _consume_runtime_terminal(client, repo, "wl-done", "destroyed") is False
+    assert repo._meetings[m["id"]]["status"] == "completed"
+
+
+def test_runtime_nonterminal_state_does_not_advance_meeting():
+    """A non-terminal runtime state (`running`) is NOT evidence of anything — the meeting is untouched."""
+    repo = _ReconcileRepo()
+    m = _seed(repo, status="stopping")
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-run"
+    client = TestClient(create_app(meeting_repo=repo))
+
+    assert _consume_runtime_terminal(client, repo, "wl-run", "running") is False
+    assert repo._meetings[m["id"]]["status"] == "stopping"
+
+
+def test_runtime_destroyed_unknown_workload_is_noop():
+    """A `destroyed` for a workload id no meeting owns → no-op (never fabricate a terminal)."""
+    repo = _ReconcileRepo()
+    m = _seed(repo, status="stopping")
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-known"
+    client = TestClient(create_app(meeting_repo=repo))
+
+    assert _consume_runtime_terminal(client, repo, "ghost-wl", "destroyed") is False
+    assert repo._meetings[m["id"]]["status"] == "stopping"
+
+
+# ── Bug 3: a TERMINAL meeting emits `session_end` on tc:meeting:{native} → the copilot worker reaps ─
+# Six vexa-worker-meet-<native> copilot workers stayed up for HOURS after their meetings ended: the
+# ONLY reap signal the worker honours is a `session_end` marker on its transcript feed
+# `tc:meeting:{native}` (agent worker/meeting.py) OR its VEXA_IDLE_TIMEOUT_SEC (default 4h). When the
+# bot never emitted `session_end` (SIGKILLed, or stopped in the waiting room — Bug 2), the worker sat
+# idle for the full 4h. The lifecycle fix: on a terminal FSM advance, meeting-api emits the session_end
+# marker onto the ROW-keyed feed tc:meeting:{meeting_row_id} — the SAME carrier the collector
+# (collector/ingest.py _transcript_stream) writes and the worker tails (VEXA_TRANSCRIPT_STREAM), post P0
+# row-scoping (fix/transcript-cross-tenant-leak). Native is never a data key. This reaps the copilot
+# immediately regardless of how the bot died.
+
+class _StreamRecordingRedis:
+    """A redis fake that records BOTH publishes and xadds (the copilot-reap path uses xadd)."""
+
+    def __init__(self):
+        self.published: list[tuple[str, dict]] = []
+        self.streams: dict[str, list[dict]] = {}
+
+    async def publish(self, channel: str, data: str):
+        self.published.append((channel, json.loads(data)))
+        return 1
+
+    async def xadd(self, stream: str, payload: dict):
+        self.streams.setdefault(stream, []).append(payload)
+        return f"{len(self.streams[stream])}-0"
+
+
+def _drive_terminal_seam(client, connection_id="sess-uid", *, terminal="completed"):
+    """Drive a fresh record joining→active→terminal (or joining→failed) over the HTTP seam."""
+    hops = (["joining", "active", "completed"] if terminal == "completed" else ["joining", "failed"])
+    for st in hops:
+        ev = {"connection_id": connection_id, "status": st}
+        if st == "completed":
+            ev["completion_reason"] = "stopped"
+        if st == "failed":
+            ev["completion_reason"] = "join_failure"
+            ev["exit_code"] = 1
+        r = _post(client, **ev)
+        assert r.status_code == 200, r.text
+
+
+def test_terminal_meeting_emits_session_end_to_reap_copilot():
+    """On `completed`, meeting-api xadds a session_end marker to the ROW-keyed feed
+    tc:meeting:{meeting_row_id} — the copilot worker's reap signal. Keyed by the meetings-domain
+    numeric ROW id (post P0 row-scoping), the SAME carrier the collector writes and the worker tails
+    (VEXA_TRANSCRIPT_STREAM=tc:meeting:{row_id}). The native id is NEVER a data key — a regression that
+    reverts to tc:meeting:{native} would land on a dead key and the copilot would never reap."""
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status="requested")   # native_meeting_id == "m1"; m["id"] is the numeric ROW id
+    redis = _StreamRecordingRedis()
+    client = TestClient(create_app(meeting_repo=repo, redis=redis))
+
+    _drive_terminal_seam(client, terminal="completed")
+
+    stream = f"tc:meeting:{m['id']}"
+    assert stream in redis.streams, f"no session_end on the ROW-keyed stream; streams={list(redis.streams)}"
+    # The native-keyed stream must NOT be written — native is never a data key post P0.
+    assert "tc:meeting:m1" not in redis.streams, "regressed to the native-keyed (dead) stream"
+    markers = [p for p in redis.streams[stream] if p.get("type") == "session_end"]
+    assert len(markers) == 1
+
+
+def test_failed_meeting_also_reaps_copilot():
+    """A meeting that terminates `failed` (e.g. the bot never got admitted) ALSO emits session_end —
+    a copilot armed for it must not linger for the idle window either. Row-keyed (post P0)."""
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status="requested")
+    redis = _StreamRecordingRedis()
+    client = TestClient(create_app(meeting_repo=repo, redis=redis))
+
+    _drive_terminal_seam(client, terminal="failed")
+
+    stream = f"tc:meeting:{m['id']}"
+    markers = [p for p in redis.streams.get(stream, []) if p.get("type") == "session_end"]
+    assert len(markers) == 1
+    assert "tc:meeting:m1" not in redis.streams, "regressed to the native-keyed (dead) stream"
+
+
+def test_non_terminal_advance_does_not_emit_session_end():
+    """A non-terminal advance (joining/active) must NOT reap the copilot — the meeting is still live."""
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status="requested")
+    redis = _StreamRecordingRedis()
+    client = TestClient(create_app(meeting_repo=repo, redis=redis))
+
+    _post(client, connection_id="sess-uid", status="joining")
+    _post(client, connection_id="sess-uid", status="active")
+
+    stream = f"tc:meeting:{m['id']}"
+    assert stream not in redis.streams, "session_end emitted while the meeting is still live"
+    assert "tc:meeting:m1" not in redis.streams
+
+
+def test_idempotent_terminal_replay_does_not_double_reap():
+    """A redelivered terminal (no_op) must NOT xadd a second session_end (the reap is once-per-advance)."""
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status="requested")
+    redis = _StreamRecordingRedis()
+    client = TestClient(create_app(meeting_repo=repo, redis=redis))
+
+    _drive_terminal_seam(client, terminal="completed")
+    # Redeliver the terminal (the bot retries its terminal callback up to 3x) — an idempotent 200 no-op.
+    r = _post(client, connection_id="sess-uid", status="completed", completion_reason="stopped")
+    assert r.status_code == 200
+
+    stream = f"tc:meeting:{m['id']}"
+    markers = [p for p in redis.streams.get(stream, []) if p.get("type") == "session_end"]
+    assert len(markers) == 1, f"double reap on idempotent replay: {markers}"
+
+
+# ── #807: the FULL user-stop chain for a bot that never reached the meeting ──────────────────────
+# The unit rows above seed a pre-active status DIRECTLY, so they always passed — the defect lived in
+# the hop they skip. Going through DELETE /bots is what exposed it: the stop wrote `stopping` over
+# `awaiting_admission`, `_WAS_ACTIVE_STATUSES` then read that as "the bot was live", and the meeting
+# was persisted `completed` with zero transcript — over an `awaiting_admission → completed` edge
+# LEGAL_TRANSITIONS does not contain. In prod this was 49% of all zero-segment `completed` meetings.
+
+
+def _stop_then_destroy(status: str):
+    """Seed a meeting AT `status`, stop it through the real DELETE route, then post the runtime's
+    destroy callback to the REAL ``POST /runtime/callback`` route. Returns the final row.
+
+    Driving the shipped route matters here: it applies the terminal in-process with
+    ``force_terminal_on_destroy=True``, which is what lets the edge land from a stale/entry FSM
+    state. The lower-level ``_consume_runtime_terminal`` helper above posts the plain lifecycle
+    callback instead, so it cannot advance a `requested` row — a property of the harness, not of
+    the product."""
+    from meeting_api.lifecycle.stop_router import InMemoryCommandPublisher
+
+    repo, pub = _ReconcileRepo(), InMemoryCommandPublisher()
+    m = _seed(repo, status=status)
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-stopped"
+    client = TestClient(create_app(meeting_repo=repo, command_publisher=pub))
+
+    r = client.delete("/bots/google_meet/m1", headers={"x-user-id": "1"})
+    assert r.status_code == 200, r.text
+    rc = client.post("/runtime/callback", json={"workloadId": "wl-stopped", "state": "destroyed"})
+    assert rc.status_code == 200, rc.text
+    return repo._meetings[m["id"]]
+
+
+def test_user_stop_of_a_never_admitted_bot_is_failed_not_completed():
+    """A bot the user abandoned in the waiting room produced NOTHING. Reporting it `completed` is a
+    silent value failure — the system claiming success for a run with no transcript."""
+    row = _stop_then_destroy("awaiting_admission")
+    assert row["status"] == "failed", (
+        "a bot that was never admitted must not be reported as a completed meeting"
+    )
+    assert row["data"].get("failure_stage") == "awaiting_admission", (
+        "the stage the bot actually died in must survive the stop"
+    )
+
+
+def test_user_stop_before_admission_is_never_retried():
+    """The reason must be the USER-terminal one. `awaiting_admission_timeout` is TRANSIENT
+    (retry.py), so attributing a deliberate cancellation to it would re-spawn the bot three times
+    against a meeting the user already walked away from — spending their quota to do it."""
+    from meeting_api.lifecycle.retry import RetryClass, classify_retry
+    from meeting_api.lifecycle.machine import CompletionReason
+
+    for stage in ("requested", "joining", "awaiting_admission"):
+        row = _stop_then_destroy(stage)
+        reason = row["data"].get("completion_reason")
+        assert reason == "stopped", f"{stage}: expected the user-terminal reason, got {reason!r}"
+        assert classify_retry(CompletionReason(reason)) is RetryClass.PERMANENT
+        assert row["data"].get("stop_requested") is True
+
+
+def test_a_timed_out_admission_is_still_transient_and_still_retried():
+    """No-regression: without a user stop, an admission wait that dies on its own keeps the
+    TRANSIENT reason — the retry behaviour this fix must not disturb."""
+    from meeting_api.lifecycle.retry import RetryClass, classify_retry
+    from meeting_api.lifecycle.machine import CompletionReason
+
+    repo = _ReconcileRepo()
+    m = _seed(repo, status="awaiting_admission")
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-timeout"
+    client = TestClient(create_app(meeting_repo=repo))
+
+    assert _consume_runtime_terminal(client, repo, "wl-timeout", "destroyed") is True
+    row = repo._meetings[m["id"]]
+    assert row["status"] == "failed"
+    assert row["data"].get("completion_reason") == "awaiting_admission_timeout"
+    assert classify_retry(CompletionReason("awaiting_admission_timeout")) is RetryClass.TRANSIENT
+
+
+def test_user_stop_of_a_live_bot_still_completes():
+    """No-regression, the other side of the same fork: a bot that DID reach the meeting and is then
+    stopped completes with `stopped` — it delivered a real (possibly partial) meeting."""
+    row = _stop_then_destroy("active")
+    assert row["status"] == "completed"
+    assert row["data"].get("completion_reason") == "stopped"
+
+
+# ── #803: the in-process envelope capture is BOUNDED (RSS-leak regression guard) ─────────────────
+def test_status_change_envelope_log_is_bounded_under_sustained_callbacks():
+    """The in-process ``app.state.status_change_webhooks`` capture is an eval/introspection seam that
+    lives on the PRODUCTION app; every bot lifecycle callback appends one envelope embedding the
+    meeting projection. Left unbounded it grew RSS monotonically under production callback traffic
+    (#803) — invisible to idle staging (no callbacks) and to single-endpoint hammering (never hits
+    this path). It must be a bounded ring buffer.
+
+    BUG (pre-fix): the capture was ``[]`` — its length equalled the number of advances forever.
+    Expected: after cap+N genuine advances the capture holds at most the cap, and it holds the most
+    RECENT envelopes (ring semantics every reader relies on)."""
+    from meeting_api.app import _ENVELOPE_LOG_CAP
+
+    repo = InMemoryMeetingRepo()
+    app = create_app(meeting_repo=repo)
+    client = TestClient(app)
+
+    overshoot = _ENVELOPE_LOG_CAP + 50
+    for i in range(overshoot):
+        uid = f"leak-sess-{i}"
+        _seed(repo, status="requested", session_uid=uid)
+        r = client.post(ENDPOINT, json={"connection_id": uid, "status": "joining"})
+        assert r.status_code == 200, r.text
+
+    cap = _ENVELOPE_LOG_CAP
+    assert len(app.state.status_change_webhooks) == cap, (
+        f"envelope capture unbounded: {overshoot} advances retained "
+        f"{len(app.state.status_change_webhooks)} envelopes (expected cap {cap})"
+    )
+    # ring semantics: the LAST advance is still the most recent captured envelope
+    last = app.state.status_change_webhooks[-1]["data"]["meeting"]["connection_id"]
+    assert last == f"leak-sess-{overshoot - 1}"
+
+
+# ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
+# ║ #862 — a bot LEGITIMATELY WAITING IN THE LOBBY must outlive the control plane's sweep           ║
+# ╚══════════════════════════════════════════════════════════════════════════════════════════════╝
+# The control plane hands every gmeet bot a 600s lobby budget (`bot_spawn/service.py`
+# `waitingRoomTimeout`), and a lobby bot emits `awaiting_admission` ONCE then polls silently — there
+# is no heartbeat, so `updated_at` stops moving for the whole wait. The sweep reaped at 300s. Because
+# the liveness gate covered only `active`/`needs_help`, a pre-active row skipped the probe entirely
+# and was force-deleted with a MANUFACTURED `left_alone` (`_PERMANENT` in retry.py → the legitimate
+# re-spawn was cancelled too). Both halves are fixed here: pre-active statuses are liveness-gated,
+# and a genuinely-dead pre-active workload is attributed from the stage + the probe's own evidence.
+
+def _set_updated_age(repo: InMemoryMeetingRepo, meeting_id: int, seconds: float) -> None:
+    """Age a row's ``updated_at`` by exactly ``seconds`` (the sweep's grace is measured off it)."""
+    from datetime import datetime, timedelta, timezone
+    repo._meetings[meeting_id]["updated_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=seconds)
+    ).isoformat()
+
+
+def _terminal_reason(repo: InMemoryMeetingRepo, meeting_id: int) -> str:
+    """The `reason` string the terminal transition actually recorded (the trail entry)."""
+    trail = repo._meetings[meeting_id]["data"].get("status_transition", [])
+    return next((t.get("reason") or "" for t in reversed(trail) if t.get("reason")), "")
+
+
+def test_live_lobby_bot_is_not_reaped_past_the_active_grace():
+    """A3 — THE HEADLINE. A bot sitting in the Meet waiting room reports `awaiting_admission` once,
+    then polls silently for up to its 600s budget. Its row goes quiet; its WORKLOAD IS ALIVE. The
+    sweep must SKIP it, so the bot resolves its own admission (admitted, or an honest
+    `awaiting_admission_timeout` at 600s) — never a force-delete at 300s of legitimate quiet."""
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status="awaiting_admission")   # updated_at far in the past — past any grace
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-lobby"
+    runtime = FakeRuntimeClient(
+        workloads={"wl-lobby": {"workloadId": "wl-lobby", "state": "running"}}
+    )
+    client = TestClient(create_app(meeting_repo=repo))
+
+    n = _run_general_sweep_rt(client, repo, runtime)
+    assert n == 0, "a LIVE lobby bot must never be reaped on updated_at staleness alone"
+    assert repo._meetings[m["id"]]["status"] == "awaiting_admission"
+    assert runtime.deleted == [], "the live workload must NOT be torn down"
+
+
+@pytest.mark.parametrize("status", ["requested", "joining", "awaiting_admission"])
+def test_every_pre_active_status_is_liveness_gated(status):
+    """The gate covers the whole pre-active span, not just the lobby: `requested` (spawned, not yet
+    reported) and `joining` (driving the join UI) are equally quiet-but-live states."""
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status=status)
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-pre"
+    runtime = FakeRuntimeClient(
+        workloads={"wl-pre": {"workloadId": "wl-pre", "state": "starting"}}
+    )
+    client = TestClient(create_app(meeting_repo=repo))
+
+    assert _run_general_sweep_rt(client, repo, runtime) == 0
+    assert repo._meetings[m["id"]]["status"] == status
+    assert runtime.deleted == []
+
+
+def test_dead_lobby_workload_is_attributed_to_the_admission_wait_with_evidence():
+    """A1 — when the probe says the workload is GENUINELY gone, the reason is DERIVED from the stage
+    (`awaiting_admission` → `awaiting_admission_timeout`) and carries the probe's own evidence
+    (workload state + exit code). No more manufactured `left_alone`/"bot gone while …", which was
+    written with zero liveness evidence AND is `_PERMANENT` — it cancelled the legitimate re-spawn."""
+    from meeting_api.lifecycle.machine import CompletionReason
+    from meeting_api.lifecycle.retry import RetryClass, classify_retry
+
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status="awaiting_admission")
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-dead"
+    runtime = FakeRuntimeClient(
+        workloads={"wl-dead": {"workloadId": "wl-dead", "state": "exited", "exitCode": 137}}
+    )
+    client = TestClient(create_app(meeting_repo=repo))
+
+    n = _run_general_sweep_rt(client, repo, runtime)
+    assert n == 1
+    row = repo._meetings[m["id"]]
+    assert row["status"] == "failed"
+    reason_code = row["data"].get("completion_reason")
+    assert reason_code == "awaiting_admission_timeout", (
+        f"a never-admitted bot cannot have been 'left alone'; got {reason_code!r}"
+    )
+    # the row is RETRY-ELIGIBLE again (left_alone is _PERMANENT; this reason is TRANSIENT)
+    assert classify_retry(CompletionReason(reason_code)) is RetryClass.TRANSIENT
+    note = _terminal_reason(repo, m["id"])
+    assert "exited" in note and "137" in note, f"reason must carry the probe evidence: {note!r}"
+    assert "bot gone" not in note, f"the manufactured phrase must be gone: {note!r}"
+    assert "wl-dead" in runtime.deleted, "a confirmed-dead workload is still torn down"
+
+
+def test_dead_joining_workload_is_attributed_to_join_failure():
+    """The earlier pre-active stages never reached the waiting room → `join_failure` (also
+    TRANSIENT), not the admission-timeout reason and not `left_alone`."""
+    from meeting_api.lifecycle.machine import CompletionReason
+    from meeting_api.lifecycle.retry import RetryClass, classify_retry
+
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status="joining")
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-crash"
+    runtime = FakeRuntimeClient(
+        workloads={"wl-crash": {"workloadId": "wl-crash", "state": "crashed", "exitCode": 1}}
+    )
+    client = TestClient(create_app(meeting_repo=repo))
+
+    assert _run_general_sweep_rt(client, repo, runtime) == 1
+    row = repo._meetings[m["id"]]
+    assert row["status"] == "failed"
+    assert row["data"].get("completion_reason") == "join_failure"
+    assert row["data"].get("failure_stage") == "joining"
+    assert classify_retry(CompletionReason("join_failure")) is RetryClass.TRANSIENT
+    assert "crashed" in _terminal_reason(repo, m["id"])
+
+
+def test_user_stopped_pre_active_reap_is_never_retried():
+    """`stop_requested` still overrides the stage attribution (#807): a deliberate cancellation
+    seals as the PERMANENT `stopped`, so the re-spawn machinery never spends the user's quota
+    re-joining a meeting they walked away from."""
+    from meeting_api.lifecycle.machine import CompletionReason
+    from meeting_api.lifecycle.retry import RetryClass, classify_retry
+
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status="awaiting_admission")
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-stopped"
+    repo._meetings[m["id"]]["data"]["stop_requested"] = True
+    runtime = FakeRuntimeClient(
+        workloads={"wl-stopped": {"workloadId": "wl-stopped", "state": "destroyed"}}
+    )
+    client = TestClient(create_app(meeting_repo=repo))
+
+    assert _run_general_sweep_rt(client, repo, runtime) == 1
+    row = repo._meetings[m["id"]]
+    assert row["status"] == "failed"
+    assert row["data"].get("completion_reason") == "stopped"
+    assert classify_retry(CompletionReason("stopped")) is RetryClass.PERMANENT
+
+
+# ── negative controls: the behaviours this change must NOT disturb ───────────────────────────────
+
+def test_active_liveness_gate_behaviour_is_unchanged():
+    """NEGATIVE CONTROL. The `active` gate keeps both of its halves: a live workload is skipped, a
+    runtime-confirmed terminal workload still completes with `left_alone` (the bot WAS in the
+    meeting — there, `left_alone` is the honest reason, not a manufactured one)."""
+    repo = InMemoryMeetingRepo()
+    live = _seed(repo, status="active", session_uid="sess-live")
+    repo._meetings[live["id"]]["bot_container_id"] = "wl-a-live"
+    client = TestClient(create_app(meeting_repo=repo))
+    runtime = FakeRuntimeClient(
+        workloads={"wl-a-live": {"workloadId": "wl-a-live", "state": "running"}}
+    )
+    assert _run_general_sweep_rt(client, repo, runtime) == 0
+    assert repo._meetings[live["id"]]["status"] == "active"
+
+    repo2 = InMemoryMeetingRepo()
+    dead = _seed(repo2, status="active", session_uid="sess-dead")
+    repo2._meetings[dead["id"]]["bot_container_id"] = "wl-a-dead"
+    client2 = TestClient(create_app(meeting_repo=repo2))
+    runtime2 = FakeRuntimeClient(
+        workloads={"wl-a-dead": {"workloadId": "wl-a-dead", "state": "stopped"}}
+    )
+    assert _run_general_sweep_rt(client2, repo2, runtime2) == 1
+    assert repo2._meetings[dead["id"]]["status"] == "completed"
+    assert repo2._meetings[dead["id"]]["data"].get("completion_reason") == "left_alone"
+
+
+def test_stopping_row_still_reaps_on_its_short_grace():
+    """NEGATIVE CONTROL. `stopping` stays EXEMPT from the liveness gate — a stop was requested, so
+    the row converges on its short grace even while the workload still reports alive."""
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status="stopping")
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-stop"
+    repo._meetings[m["id"]]["data"]["stop_requested"] = True
+    _set_updated_age(repo, m["id"], 60)          # past stop_grace (45), inside active_grace (300)
+    runtime = FakeRuntimeClient(
+        workloads={"wl-stop": {"workloadId": "wl-stop", "state": "running"}}
+    )
+    client = TestClient(create_app(meeting_repo=repo))
+
+    assert _run_general_sweep_rt(client, repo, runtime) == 1
+    assert repo._meetings[m["id"]]["status"] == "completed"
+    assert "wl-stop" in runtime.deleted
+
+
+def test_pre_active_row_with_no_workload_at_all_still_reconciles():
+    """NEGATIVE CONTROL (no row leaks forever). A pre-active row with NO recorded workload has
+    nothing that could be alive — the gate does not apply, so it still converges on the time window,
+    with a note that says so instead of claiming a bot went missing. (`joining`, not `requested`:
+    the FSM's only legal first edge is `<new>` → `joining`, so a never-reported row's convergence
+    rides the runtime-destroy force path, not this callback — unchanged by #862.)"""
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status="joining")
+    runtime = FakeRuntimeClient(workloads={})
+    client = TestClient(create_app(meeting_repo=repo))
+
+    assert _run_general_sweep_rt(client, repo, runtime) == 1
+    row = repo._meetings[m["id"]]
+    assert row["status"] == "failed"
+    assert row["data"].get("completion_reason") == "join_failure"
+    assert "no workload recorded" in _terminal_reason(repo, m["id"])
+
+
+def test_pre_active_untracked_workload_still_escalates_on_the_bounded_window():
+    """NEGATIVE CONTROL (no row leaks forever, part 2). Now that pre-active rows are probed, a
+    runtime 404 lands them on the SAME bounded untracked escalation as `active`: no reap on the
+    404 itself (amnesia is not evidence), and convergence to `failed` once the window elapses —
+    with the stage-derived reason, so the re-spawn is still allowed."""
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status="awaiting_admission")
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-404"
+    runtime = FakeRuntimeClient(workloads={})
+    client = TestClient(create_app(meeting_repo=repo))
+    tracker: dict = {}
+
+    assert _run_general_sweep_esc(client, repo, runtime, tracker, untracked_grace=0.0) == 0
+    assert repo._meetings[m["id"]]["status"] == "awaiting_admission"   # window opened only
+    assert runtime.deleted == []
+
+    assert _run_general_sweep_esc(client, repo, runtime, tracker, untracked_grace=0.0) == 1
+    row = repo._meetings[m["id"]]
+    assert row["status"] == "failed"
+    assert row["data"].get("completion_reason") == "awaiting_admission_timeout"
+    assert "presumed lost" in _terminal_reason(repo, m["id"])
+
+
+# ── the constant itself: 300s for a bot-present row, and a PRE-ACTIVE floor above the 600s budget ──
+
+def test_active_grace_boundary_is_exactly_the_configured_window():
+    """The 325s prod signature decomposes to `active_grace(300) + time-to-lobby + sweep phase`.
+    Pin the constant: 299s quiet is NOT listed, 301s IS."""
+    for age, expect in ((299, 0), (301, 1)):
+        repo = InMemoryMeetingRepo()
+        m = _seed(repo, status="active")
+        _set_updated_age(repo, m["id"], age)
+        client = TestClient(create_app(meeting_repo=repo))
+        assert _run_general_sweep(client, repo) == expect, f"age={age}s"
+
+
+def test_pre_active_grace_floor_outlives_the_lobby_budget_we_issue():
+    """F4 — the control plane's patience can never be shorter than the deadline it issues. A lobby
+    bot holds a 600s budget, so a pre-active row is not even LISTED before the pre-active floor
+    (660s) elapses — belt to the liveness gate's braces, for the case where the probe is
+    inconclusive."""
+    for age, expect in ((301, 0), (661, 1)):
+        repo = InMemoryMeetingRepo()
+        m = _seed(repo, status="awaiting_admission")
+        _set_updated_age(repo, m["id"], age)
+        client = TestClient(create_app(meeting_repo=repo))
+        n = _run_general_sweep(client, repo, preactive_grace=660.0)
+        assert n == expect, f"age={age}s → {n} (expected {expect})"
+
+
+def test_default_pre_active_grace_is_derived_from_the_issued_lobby_budget():
+    """The floor is DERIVED, not a second magic number: it is the very ``waitingRoomTimeout`` the
+    spawn hands the bot, plus headroom. If someone shortens the budget the floor follows; if
+    someone lengthens it, this anchor fails loudly rather than re-opening #862."""
+    from meeting_api.bot_spawn.service import LOBBY_BUDGET_MS
+    from meeting_api.lifecycle.reconcile import default_preactive_grace
+
+    assert LOBBY_BUDGET_MS == 600_000
+    assert default_preactive_grace() == 660.0
+    assert default_preactive_grace() > LOBBY_BUDGET_MS / 1000.0

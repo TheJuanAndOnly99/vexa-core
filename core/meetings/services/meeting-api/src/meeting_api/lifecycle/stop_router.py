@@ -22,7 +22,7 @@ from typing import Any, Optional, Protocol, runtime_checkable
 
 from fastapi import APIRouter, Header, HTTPException
 
-from ..bot_spawn.ports import MeetingRepo
+from ..bot_spawn.ports import MeetingRepo, WorkloadUnknown
 from .stop import leave_command_channel, leave_command_payload
 
 
@@ -66,7 +66,7 @@ _BOOTING_STATUSES = {"requested", "joining", "awaiting_admission"}
 # unsupported platform is a VALIDATION error (422), not a missing-resource (404). Mirrors the POST /bots
 # platform guard (A1/A3): reject a non-enum platform up front, BEFORE the find_active lookup (which would
 # otherwise miss and 404 — drifting from the contract a client must code against).
-_SUPPORTED_PLATFORMS = frozenset({"google_meet", "zoom", "teams", "browser_session"})
+_SUPPORTED_PLATFORMS = frozenset({"google_meet", "zoom", "teams", "jitsi", "browser_session"})
 
 
 def build_stop_router(repo: MeetingRepo, publisher: CommandPublisher, runtime=None) -> APIRouter:
@@ -96,20 +96,54 @@ def build_stop_router(repo: MeetingRepo, publisher: CommandPublisher, runtime=No
         meeting = await repo.find_active(user_id, platform, native_meeting_id)
         if not meeting:
             raise HTTPException(status_code=404, detail="No active meeting for this bot")
+        # The stop trigger is ONE-SHOT. Redelivering DELETE must not re-publish a leave command or
+        # re-tear-down a workload, so the guard is the user-intent flag itself rather than a status
+        # side-effect: `stop_requested` is set by the first stop and is true regardless of which
+        # status the meeting was stopped at. (Reading it off the status cannot work — the SQL
+        # adapter's active set contains `stopping`, so a second DELETE still FINDS the row.)
+        if (meeting.get("data") or {}).get("stop_requested"):
+            raise HTTPException(status_code=404, detail="No active meeting for this bot")
         meeting_id = meeting["id"]
         status = meeting.get("status")
         bot_container_id = meeting.get("bot_container_id")
-        # Mark stop-requested + move to 'stopping' (mirrors main's DELETE), keyed by the latest session
-        # so the exit classifier reads the user-intent signal. Best-effort: an unknown session no-ops.
+        # Mark stop-requested, keyed by the latest session so the exit classifier reads the user-intent
+        # signal. Best-effort: an unknown session no-ops.
+        #
+        # `stopping` is written ONLY over a status where the bot actually reached the meeting. It means
+        # "a live bot is being asked to leave", and the whole terminal chain reads it that way:
+        # `reconcile._WAS_ACTIVE_STATUSES` completes it, and `machine._PERSISTED_STATUS_TO_BOTSTATUS`
+        # rehydrates it as ACTIVE. Writing it over a PRE-ACTIVE status (a bot still in the waiting room)
+        # destroyed the only record of the stage the bot died in, and every downstream reader then
+        # concluded the bot had been live — so a bot that was never admitted was persisted as
+        # `completed` with zero transcript, via an `awaiting_admission → completed` edge the state
+        # machine does not even consider legal (#807). A pre-active bot has nothing to leave: its
+        # workload is torn down directly below, and the terminal is attributed to the stage it really
+        # reached.
         sessions = await repo.list_sessions(meeting_id=meeting_id)
         if sessions:
             await repo.update_meeting_status(
-                session_uid=sessions[-1], status="stopping", data={"stop_requested": True},
+                session_uid=sessions[-1],
+                status=status if status in _BOOTING_STATUSES else "stopping",
+                data={"stop_requested": True},
             )
         # Publish the leave command — an ACTIVE (listening) bot honours it, leaves, emits its terminal event.
-        await publisher.publish(
-            leave_command_channel(meeting_id), json.dumps(leave_command_payload(meeting_id))
-        )
+        # #809: this is a GENUINELY Redis-dependent path (pub/sub is the only delivery). During a Redis
+        # outage it must fail NARROWLY per-request (503, retryable) — not as an opaque 500 stack trace,
+        # and never process-wide. The `stopping` mark above is already persisted to Postgres, so the
+        # stop-reconcile sweep still converges the meeting when Redis returns; a 503 tells the caller to
+        # retry the leave once the cache is back.
+        try:
+            await publisher.publish(
+                leave_command_channel(meeting_id), json.dumps(leave_command_payload(meeting_id))
+            )
+        except HTTPException:
+            raise
+        except Exception as e:  # noqa: BLE001 — Redis unreachable → narrow, retryable failure
+            raise HTTPException(
+                status_code=503,
+                detail="stop command bus (redis) unavailable; the stop is recorded and will "
+                       "reconcile when redis returns — retry to re-issue the leave",
+            ) from e
         # GUARANTEE no orphan: a stop must not rely solely on a fire-and-forget command the bot may never
         # receive. A BOOTING bot (status in _BOOTING_STATUSES) has likely not subscribed yet → directly
         # tear its workload down (it has nothing to finalize). Best-effort: logged, never fails the stop.
@@ -128,11 +162,19 @@ def build_stop_router(repo: MeetingRepo, publisher: CommandPublisher, runtime=No
 
 
 def _log_stop_teardown_failed(meeting_id, workload_id, err) -> None:
+    # A runtime 404 (WorkloadUnknown) means termination is UNCONFIRMED — a container may still be
+    # live. That is a louder failure (error) than a transient delete error (warning): the meeting
+    # stays `stopping` until the reconcile sweep gets a CONFIRMED teardown, never silently "done".
+    unconfirmed = isinstance(err, WorkloadUnknown)
     try:
         from ..obs import log_event
 
-        log_event("stop_workload_teardown_failed", audience="system", level="warning",
-                  span="bots.stop",
-                  fields={"meeting_id": meeting_id, "workload_id": workload_id, "error": str(err)})
+        log_event(
+            "stop_workload_teardown_unconfirmed" if unconfirmed else "stop_workload_teardown_failed",
+            audience="system",
+            level="error" if unconfirmed else "warning",
+            span="bots.stop",
+            fields={"meeting_id": meeting_id, "workload_id": workload_id, "error": str(err)},
+        )
     except Exception:
         pass

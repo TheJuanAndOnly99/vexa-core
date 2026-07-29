@@ -47,13 +47,15 @@ def test_entrypoint_then_interactive_then_idle():
     serve(s, out_topic="unit:u:out", in_topic="unit:u:in", turn=_turn,
           start={"entrypoint": {"inline": "hello"}}, idle_ms=10)
     evs = s.events()
-    # t0 (entrypoint "hello"): delta, commit, turn-complete
-    assert evs[0] == {"type": "message-delta", "text": "re:hello", "turn_id": "t0"}
-    assert evs[1]["type"] == "commit" and evs[1]["turn_id"] == "t0"
-    assert evs[2] == {"type": "turn-complete", "turn_id": "t0"}
+    # t0 (entrypoint "hello"): accepted, delta, commit, turn-complete
+    assert evs[0] == {"type": "turn-accepted", "turn_id": "t0"}
+    assert evs[1] == {"type": "message-delta", "text": "re:hello", "turn_id": "t0"}
+    assert evs[2]["type"] == "commit" and evs[2]["turn_id"] == "t0"
+    assert evs[3] == {"type": "turn-complete", "turn_id": "t0"}
     # t1 (interactive "again")
-    assert evs[3] == {"type": "message-delta", "text": "re:again", "turn_id": "t1"}
-    assert evs[5] == {"type": "turn-complete", "turn_id": "t1"}
+    assert evs[4] == {"type": "turn-accepted", "turn_id": "t1"}
+    assert evs[5] == {"type": "message-delta", "text": "re:again", "turn_id": "t1"}
+    assert evs[7] == {"type": "turn-complete", "turn_id": "t1"}
     assert all(t == "unit:u:out" for t, _ in s.out)
 
 
@@ -62,14 +64,85 @@ def test_session_start_serves_inbox_without_entrypoint_turn():
     serve(s, out_topic="o", in_topic="i", turn=_turn,
           start={"session": {"ref": ".claude/.session"}}, idle_ms=10)
     evs = s.events()
-    # no t0 — the first event is the interactive turn t1
-    assert evs[0]["turn_id"] == "t1"
+    # no t0 — the first event is the interactive turn t1's liveness ack
+    assert evs[0]["turn_id"] == "t1" and evs[0]["type"] == "turn-accepted"
 
 
 def test_stop_message_exits_immediately():
     s = FakeStream(inbox=[("1-0", {"turn": json.dumps({"type": "stop"})}), _msg("2-0", "never")])
     serve(s, out_topic="o", in_topic="i", turn=_turn, start={}, idle_ms=10)
     assert s.out == []  # stop before any turn ran
+
+
+def test_interactive_turn_ack_echoes_the_delivery_nonce():
+    s = FakeStream(inbox=[("1-0", {"turn": json.dumps({"prompt": "warm", "nonce": "n-42"})})])
+    serve(s, out_topic="o", in_topic="i", turn=_turn, start={}, idle_ms=10)
+    evs = s.events()
+    assert evs[0] == {"type": "turn-accepted", "turn_id": "t1", "nonce": "n-42"}
+
+
+class CursorStream:
+    """A fake honoring in-topic CURSOR semantics (ids compare as redis stream ids), so the boot
+    tail-capture behavior is provable: entries already in the stream at boot are skipped; entries
+    appended later (even during the entrypoint turn) are consumed."""
+
+    def __init__(self, preloaded=None):
+        self.out = []
+        self.entries = list(preloaded or [])  # [(id, fields)] id-ordered
+
+    @staticmethod
+    def _key(eid):
+        ms, _, seq = eid.partition("-")
+        return (int(ms), int(seq or 0))
+
+    def xadd(self, name, fields):
+        self.out.append((name, fields))
+        return str(len(self.out))
+
+    def xrevrange(self, name, count=1):
+        return list(reversed(self.entries))[:count]
+
+    def xread(self, streams, count=1, block=None):
+        topic, last = next(iter(streams.items()))
+        if last == "$":
+            return []  # nothing arrives "later" in a fake
+        pending = [e for e in self.entries if self._key(e[0]) > self._key(last)]
+        if not pending:
+            return []
+        return [(topic, [pending[0]])]
+
+    def events(self):
+        return [json.loads(f["event"]) for _t, f in self.out]
+
+
+def test_boot_tail_capture_skips_the_predelivered_copy():
+    # The dispatcher XADDs the message to unit:in BEFORE spawning (warm delivery). On a COLD spawn
+    # the same prompt arrives as the entrypoint — the pre-delivered copy must be SKIPPED, not
+    # replayed as a second turn.
+    s = CursorStream(preloaded=[("5-0", {"turn": json.dumps({"prompt": "hello", "nonce": "n1"})})])
+    serve(s, out_topic="o", in_topic="i", turn=_turn, start={"entrypoint": {"inline": "hello"}}, idle_ms=10)
+    evs = s.events()
+    assert [e["turn_id"] for e in evs] == ["t0", "t0", "t0", "t0"]  # exactly ONE turn ran
+    assert evs[1]["text"] == "re:hello"
+
+
+def test_message_landing_during_the_entrypoint_turn_is_consumed_not_lost():
+    # Before the tail-capture fix serve() read from "$" AFTER the entrypoint turn — a message that
+    # arrived while t0 ran was invisible forever (the lost-turn hang).
+    s = CursorStream(preloaded=[("5-0", {"turn": json.dumps({"prompt": "hello"})})])
+
+    def turn_with_midturn_arrival(prompt):
+        if prompt == "hello":  # t0: a follow-up lands while this turn is still running
+            s.entries.append(("6-0", {"turn": json.dumps({"prompt": "follow-up", "nonce": "n2"})}))
+        yield {"type": "message-delta", "text": f"re:{prompt}"}
+
+    serve(s, out_topic="o", in_topic="i", turn=turn_with_midturn_arrival,
+          start={"entrypoint": {"inline": "hello"}}, idle_ms=10)
+    evs = s.events()
+    texts = [e.get("text") for e in evs if e["type"] == "message-delta"]
+    assert texts == ["re:hello", "re:follow-up"]
+    accepted = [e for e in evs if e["type"] == "turn-accepted"]
+    assert accepted[1]["nonce"] == "n2"
 
 
 # ── meeting mode: consume transcript Stream → gate → emit cards ───────────────────────────────────
@@ -287,6 +360,62 @@ def test_serve_meeting_persists_and_advances_cursor():
     assert s.kv["proc:meeting:m1:cursor"] == "6-0"  # advanced to the last cleaned raw entry
 
 
+def _proc_markers(s, proc_stream):
+    return [f for name, f in s.out if name == proc_stream and f.get("type") == "view_end"]
+
+
+def test_session_end_emits_view_end_marker_after_final_beat_notes():
+    """processed-notes.v1 / ADR 0027: session_end → the final beat's notes land on the proc stream,
+    THEN exactly one view_end marker (with the last raw stream id as its auditable cursor). Consumers
+    flush/close on the marker instead of racing the final beat."""
+    s = ProcMeetingStream(inbox=[
+        _transcript("1-0", {**_seg("Jane", "um so yeah"), "segment_id": "a"}),
+        ("2-0", {"payload": json.dumps({"type": "session_end"})}),
+    ])
+    serve_meeting(
+        s, transcript_stream="tc:m1", out_topic="o", card_turn=_notes_card_turn,
+        idle_ms=10, proc_stream="proc:meeting:m1", cursor_key="proc:meeting:m1:cursor",
+    )
+    proc_entries = [(name, f) for name, f in s.out if name == "proc:meeting:m1"]
+    markers = _proc_markers(s, "proc:meeting:m1")
+    assert len(markers) == 1
+    assert markers[0]["cursor"] == "2-0"                      # the session_end entry id — auditable
+    assert proc_entries[-1][1].get("type") == "view_end"      # the marker is the stream's LAST entry
+    # the final beat's upgrade note for segment "a" was emitted BEFORE the marker
+    assert any(n["id"] == "a" and n["pass"] == 1 for n in s.proc_notes("proc:meeting:m1"))
+
+
+def test_view_end_emitted_even_with_live_beats_disabled():
+    """The marker gates on proc_stream (like the baseline notes), NOT on `enabled` — a processing-off
+    stream still completes, so the durable flush never waits for a beat that will never run."""
+    s = ProcMeetingStream(inbox=[
+        _transcript("1-0", {**_seg("Jane", "hello"), "segment_id": "a"}),
+        ("2-0", {"payload": json.dumps({"type": "session_end"})}),
+    ])
+    serve_meeting(
+        s, transcript_stream="tc:m1", out_topic="o", card_turn=_card_turn,
+        idle_ms=10, enabled=False, proc_stream="proc:meeting:m1", cursor_key="proc:meeting:m1:cursor",
+    )
+    assert len(_proc_markers(s, "proc:meeting:m1")) == 1
+
+
+def test_no_view_end_on_idle_exit_or_without_proc_stream():
+    """An idle-timeout exit is NOT completion — no marker (the consumer's deadline covers a dead
+    worker, ADR 0027's hard guarantee). And with proc_stream unset nothing is emitted anywhere."""
+    idle = ProcMeetingStream(inbox=[
+        _transcript("1-0", {**_seg("Jane", "hi"), "segment_id": "a"}),
+    ])  # inbox drains with NO session_end → the serve loop idles out
+    serve_meeting(
+        idle, transcript_stream="tc:m1", out_topic="o", card_turn=_card_turn,
+        idle_ms=10, proc_stream="proc:meeting:m1", cursor_key="proc:meeting:m1:cursor",
+    )
+    assert _proc_markers(idle, "proc:meeting:m1") == []
+
+    bare = MeetingStream(inbox=[("2-0", {"payload": json.dumps({"type": "session_end"})})])
+    serve_meeting(bare, transcript_stream="tc:m1", out_topic="o", card_turn=_card_turn, idle_ms=10)
+    assert all(not (isinstance(f, dict) and f.get("type") == "view_end") for _n, f in bare.out)
+
+
 def test_serve_meeting_upgrades_proc_note_text_from_llm_rewrite():
     """A valid LLM note for a segment UPGRADES its cleaned text on the proc stream (still 1:1 by id)."""
     s = ProcMeetingStream(inbox=[
@@ -460,6 +589,143 @@ def test_run_turn_persists_namespaced_session_file(tmp_path):
     f = tmp_path / ".claude" / "sessions" / "work.session"
     assert f.read_text() == "WORK_SID"
     assert not (tmp_path / ".claude" / ".session").exists()  # never touched the legacy single-thread file
+
+
+def test_active_mounts_reads_the_set_and_falls_back_to_baseline(monkeypatch, tmp_path):
+    from worker import worker
+    # explicit set
+    mounts = [{"slug": "seed", "path": str(tmp_path / "u1"), "role": "private", "write": True, "primary": True},
+              {"slug": "shared-x", "path": str(tmp_path / "shared"), "role": "private", "write": True, "primary": False}]
+    monkeypatch.setenv("VEXA_MOUNTS", json.dumps(mounts))
+    got = worker.active_mounts()
+    assert [m["slug"] for m in got] == ["seed", "shared-x"]
+    # fallback: no VEXA_MOUNTS → the single private baseline from VEXA_WORKSPACE_PATH
+    monkeypatch.delenv("VEXA_MOUNTS", raising=False)
+    monkeypatch.setenv("VEXA_WORKSPACE_PATH", "/workspaces/u1")
+    base = worker.active_mounts()
+    assert len(base) == 1 and base[0]["primary"] is True and base[0]["path"] == "/workspaces/u1"
+
+
+def test_adopt_legacy_continuity_migrates_pointer_and_transcript(tmp_path, monkeypatch):
+    """A thread recorded BEFORE continuity anchored to _system (pointer+transcript under the then-cwd)
+    must be ADOPTED into the anchor on next resume — otherwise turn 2 answers 'this is the first
+    message I'm seeing' (the carrier moved and forked the fact)."""
+    from worker import engine
+    monkeypatch.delenv("VEXA_MOUNTS", raising=False)
+    work = tmp_path / "ws"
+    sysroot = tmp_path / ".system" / "28"
+    (work / ".claude" / "sessions").mkdir(parents=True)
+    (work / ".claude" / "sessions" / "chat-a.session").write_text("sid-old\n")
+    proj = work / ".claude" / "projects" / "-ws-slug"
+    proj.mkdir(parents=True)
+    (proj / "sid-old.jsonl").write_text('{"type":"user"}\n')
+    engine._adopt_legacy_continuity(sysroot, work, "chat-a")
+    assert (sysroot / ".claude" / "sessions" / "chat-a.session").read_text().strip() == "sid-old"
+    assert (sysroot / ".claude" / "projects" / "-ws-slug" / "sid-old.jsonl").exists()
+    # idempotent: an anchored pointer is never overwritten by a legacy one
+    (work / ".claude" / "sessions" / "chat-a.session").write_text("sid-other\n")
+    engine._adopt_legacy_continuity(sysroot, work, "chat-a")
+    assert (sysroot / ".claude" / "sessions" / "chat-a.session").read_text().strip() == "sid-old"
+
+
+def test_kg_links_preamble_ships_the_wikilink_rule():
+    """Entity mentions must render as ACTIONABLE chips in the client, so the [[Title]] referencing
+    rule is declared on EVERY turn — single-mount legacy turns included (their seeded CLAUDE.md
+    may predate it)."""
+    from worker import worker
+    txt = worker.kg_links_preamble()
+    assert "[[Title]]" in txt and "kg/entities/" in txt and "chat replies AND in workspace docs" in txt
+
+
+def test_mounts_preamble_declares_each_mount_or_stays_empty():
+    from worker import worker
+    # single mount → no preamble (nothing to disambiguate)
+    assert worker.mounts_preamble([{"slug": "seed", "path": "/w/u1", "primary": True, "write": True}]) == ""
+    # multi-mount → declares paths, slugs, roles + the write-routing policy
+    txt = worker.mounts_preamble([
+        {"slug": "seed", "path": "/w/u1", "role": "private", "write": True, "primary": True},
+        {"slug": "shared-x", "path": "/w/.attached/u1/shared-x", "role": "shared", "write": False, "primary": False},
+    ])
+    assert "/w/u1" in txt and "seed" in txt and "PRIVATE baseline" in txt
+    assert "/w/.attached/u1/shared-x" in txt and "READ-ONLY" in txt
+    assert "Write-routing policy" in txt
+
+
+def test_mounts_preamble_declares_the_three_tiers_verbatim():
+    """The three-tier stack (AMENDMENT 4) is declared to the model with each mount's TIER + write-rule so
+    it never guesses where it may write: _global READ-ONLY, _system read-write, the private baseline."""
+    from worker import worker
+    txt = worker.mounts_preamble([
+        {"slug": "_global", "path": "/w/_global", "role": "global", "write": False, "primary": False},
+        {"slug": "seed", "path": "/w/u1", "role": "private", "write": True, "primary": True},
+        {"slug": "_system", "path": "/w/.system/u1", "role": "system", "write": True, "primary": False},
+    ])
+    assert "/w/_global" in txt and "GLOBAL SYSTEM" in txt and "READ-ONLY" in txt
+    assert "/w/.system/u1" in txt and "PRIVATE SYSTEM" in txt
+    assert "PRIVATE baseline" in txt
+    # the routing policy names both system tiers explicitly
+    assert "`_global`" in txt and "`_system`" in txt
+
+
+def test_read_only_global_mount_is_never_committed(tmp_path, monkeypatch):
+    """The _global GLOBAL SYSTEM tier is READ-ONLY: even if it appears in VEXA_MOUNTS it must be EXCLUDED
+    from the per-mount commit path (agents never write, thus never commit, _global)."""
+    from worker import engine
+    private = tmp_path / "u1"; private.mkdir()
+    glob = tmp_path / "global"; glob.mkdir()
+    monkeypatch.setenv("VEXA_MOUNTS", json.dumps([
+        {"slug": "_global", "path": str(glob), "role": "global", "write": False, "primary": False},
+        {"slug": "seed", "path": str(private), "role": "private", "write": True, "primary": True},
+    ]))
+    # the read-only _global path is not among the writable extras the commit loop touches
+    assert engine._extra_mount_paths(private) == []
+
+
+def test_run_turn_declares_mounts_and_commits_extras_with_principal(tmp_path, monkeypatch):
+    """End to end at the worker seam: a chat turn with a SECOND active mount declares both to the model
+    (the preamble rides the prompt) and commits the extra mount, authored by the principal."""
+    import subprocess
+    import unittest.mock as mock
+    from worker import worker
+
+    private = tmp_path / "u1"; private.mkdir()
+    shared = tmp_path / "shared"; shared.mkdir()
+    for d in (shared,):  # the extra mount is a real repo (the primary is seeded by _ensure_repo)
+        subprocess.run(["git", "init", "-q"], cwd=str(d), check=True)
+        subprocess.run(["git", "config", "user.email", "t@t"], cwd=str(d), check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=str(d), check=True)
+        (d / "seed.md").write_text("x")
+        subprocess.run(["git", "add", "-A"], cwd=str(d), check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=str(d), check=True)
+
+    monkeypatch.setenv("VEXA_MOUNTS", json.dumps([
+        {"slug": "seed", "path": str(private), "role": "private", "write": True, "primary": True},
+        {"slug": "shared-x", "path": str(shared), "role": "private", "write": True, "primary": False},
+    ]))
+    monkeypatch.setenv("VEXA_PRINCIPAL_NAME", "Jane Doe")
+    monkeypatch.setenv("VEXA_PRINCIPAL_EMAIL", "jane@example.com")
+    seen: dict = {}
+
+    def fake_exec(argv, cwd):
+        seen["prompt"] = argv[2] if len(argv) > 2 else ""  # claude -p <prompt>
+        (shared / "note.md").write_text("shared note")     # the model writes the EXTRA mount
+        yield json.dumps({"type": "result", "subtype": "success", "result": "did it", "session_id": "S"})
+
+    with mock.patch.object(worker, "harness_factory", lambda: ClaudeCodeHarness(exec_fn=fake_exec)):
+        evs = list(worker.run_turn_over_workspace(private, "please write the shared note", session="work"))
+
+    # the mount set was DECLARED to the model (WP-A1.1)
+    assert "Your mounted workspaces" in seen["prompt"] and str(shared) in seen["prompt"]
+    # the kg-links rule ships on the same turn ([[wikilinks]] must be actionable in the client)
+    assert "Referencing knowledge" in seen["prompt"]
+    # the extra mount committed, authored by the principal (D4)
+    assert any(e["type"] == "commit" for e in evs)
+    fmt = "%an%n%ae%n%cn%n%ce"
+    an, ae, cn, ce = subprocess.run(["git", "log", "-1", f"--pretty=format:{fmt}"], cwd=str(shared),
+                                    capture_output=True, text=True).stdout.splitlines()
+    assert (an, ae) == ("Jane Doe", "jane@example.com")
+    assert (cn, ce) == ("Vexa", "platform@vexa.ai")
+    assert (shared / "note.md").exists()
 
 
 def test_run_turn_starts_fresh_when_resume_transcript_is_too_large(tmp_path, monkeypatch):
@@ -856,3 +1122,18 @@ def test_seed_claude_md_defers_copilot_steering_to_meeting_md():
     # No copilot watch/ignore steering smuggled into CLAUDE.md (only the guard *mentions* the words).
     assert "surface only new entities" not in lower
     assert "real-time meeting behavior" not in lower
+
+
+def test_serve_meeting_reaps_on_idle_without_session_end():
+    """Bug 3 backstop: an agent-meet copilot whose transcript goes QUIET with NO session_end marker
+    (the bot was SIGKILLed / stopped in the waiting room, so it never emitted one) still reaps — the
+    idle read (xread block=idle_ms) returns empty → serve_meeting RETURNS (exit 0 → container reaped).
+    This is the idle path that MUST cover meeting copilots: without it (or with a 4h idle window) the
+    worker lingers. The deterministic path is meeting-api emitting session_end on the meeting terminal;
+    this idle-reap is the guaranteed backstop."""
+    # Segments arrive, then the stream goes silent — NO session_end is ever delivered.
+    s = MeetingStream(inbox=[_transcript("1-0", _seg("Jane", "hi"), _seg("Raj", "hello"))])
+    # serve_meeting must RETURN (reap) rather than block forever — the next xread yields [] (idle).
+    serve_meeting(s, transcript_stream="tc:m1", out_topic="o", card_turn=_card_turn, idle_ms=10)
+    # It returned (the test would hang otherwise) — the copilot reaped on idle, no session_end needed.
+    assert True

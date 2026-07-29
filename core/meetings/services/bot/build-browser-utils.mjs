@@ -52,6 +52,9 @@ function moduleEntry(pkgDir) {
 const GMEET = moduleEntry('gmeet-capture');       // @vexa/gmeet-capture
 const MIXED = moduleEntry('mixed-capture-core');  // @vexa/mixed-capture-core
 const RECORD = moduleEntry('record-chunker');     // @vexa/record-chunker (MediaRecorder → recording.v1)
+const JITSI = moduleEntry('jitsi-capture');       // @vexa/jitsi-capture (dominant-speaker hints + chat)
+const TEAMS = moduleEntry('teams-capture');       // @vexa/teams-capture (voice-level-outline speaker hints)
+const ZOOM = moduleEntry('zoom-capture');         // @vexa/zoom-capture (active-speaker DOM watcher → 'dom-active' hints)
 
 // In-memory entry: import the bricks and hang them on window.VexaBrowserUtils with
 // the EXACT names capture-bridge.ts reaches for. esbuild bundles the relative
@@ -72,6 +75,17 @@ import {
 import {
   createRecordingTap,
 } from ${JSON.stringify(RECORD)};
+import {
+  createJitsiSpeakers,
+  createJitsiChat,
+  sendJitsiChatMessage,
+} from ${JSON.stringify(JITSI)};
+import {
+  createTeamsSpeakers,
+} from ${JSON.stringify(TEAMS)};
+import {
+  createZoomSpeakers,
+} from ${JSON.stringify(ZOOM)};
 
 const VexaBrowserUtils = {
   // ── gmeet lane (per-participant capture + glow attribution) ──
@@ -86,6 +100,14 @@ const VexaBrowserUtils = {
   installRemoteAudioHook,
   // ── recording (all platforms): MediaRecorder → recording.v1 chunks ──
   createRecordingTap,        // capture-bridge.ts: w.VexaBrowserUtils.createRecordingTap
+  // ── jitsi lane (dominant-speaker naming hints + chat over the app's own state) ──
+  createJitsiSpeakers,       // capture-bridge.ts: w.VexaBrowserUtils.createJitsiSpeakers
+  createJitsiChat,           // capture-bridge.ts: w.VexaBrowserUtils.createJitsiChat
+  sendJitsiChatMessage,
+  // ── teams lane (voice-level "blue-square" outline → speaker hints) ──
+  createTeamsSpeakers,       // capture-bridge.ts: w.VexaBrowserUtils.createTeamsSpeakers
+  // ── zoom lane (active-speaker DOM watcher → 'dom-active' naming hints) ──
+  createZoomSpeakers,        // capture-bridge.ts: w.VexaBrowserUtils.createZoomSpeakers
 };
 
 (globalThis).VexaBrowserUtils = VexaBrowserUtils;
@@ -130,4 +152,6 @@ console.log('📦 window.VexaBrowserUtils exposes:');
 console.log('  - createGmeetCapture / createGmeetSpeakers / createGmeetCaptureV1 / pickBoundName');
 console.log('  - GmeetChannelBinder / createPcmCaptureNode');
 console.log('  - createMixedAudioCapture / installRemoteAudioHook');
+console.log('  - createJitsiSpeakers / createJitsiChat / sendJitsiChatMessage');
+console.log('  - createTeamsSpeakers / createZoomSpeakers');
 console.log('  - window.performLeaveAction');

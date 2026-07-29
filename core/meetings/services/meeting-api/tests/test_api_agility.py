@@ -205,8 +205,9 @@ def test_404_envelope_matches_across_handlers():
 def test_method_not_allowed_405():
     store, _ = _seeded_store()
     c = _client(store=store)
-    # /meetings is GET-only at this layer; /transcripts/... is GET-only.
-    assert c.post("/meetings", headers=HEADERS, json={}).status_code == 405
+    # /meetings accepts GET + POST (planned-meeting create) but not PUT/DELETE on the collection;
+    # /transcripts/... is GET-only.
+    assert c.put("/meetings", headers=HEADERS, json={}).status_code == 405
     assert c.delete("/meetings", headers=HEADERS).status_code == 405
     assert c.put("/transcripts/google_meet/abc-defg-hij", headers=HEADERS, json={}).status_code == 405
     # /bots accepts GET + POST but not PUT/PATCH.
@@ -521,7 +522,7 @@ def test_delete_bots_invalid_platform_should_be_422():
     _assert_error_envelope(r)
 
 
-@pytest.mark.parametrize("platform", ["google_meet", "zoom", "teams", "browser_session"])
+@pytest.mark.parametrize("platform", ["google_meet", "zoom", "teams", "jitsi", "browser_session"])
 def test_delete_bots_valid_platform_nonexistent_is_404(platform):
     """Idempotent-delete preserved: a VALID platform with no active meeting still → 404
     (the 422 guard only rejects platforms outside the sealed enum, not unknown meetings)."""

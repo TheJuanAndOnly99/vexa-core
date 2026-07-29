@@ -24,7 +24,12 @@ import pytest
 
 COMPOSE_DIR = Path(__file__).resolve().parent.parent
 COMPOSE_FILE = COMPOSE_DIR / "docker-compose.yml"
-PROJECT = os.getenv("COMPOSE_PROJECT", "vexa-compose-gate")  # override on a shared host (e.g. bbb prod box)
+
+# The 0.10 backward-compat suite (compat/) is OPT-IN via V010_COMPAT=1: without it the directory
+# is not collected at all, so the default gate:compose collection is unchanged (a compat/conftest.py
+# cannot own this gate — a second module named `conftest` shadows this one and breaks imports).
+collect_ignore_glob = [] if os.getenv("V010_COMPAT") == "1" else ["compat/*"]
+PROJECT = os.getenv("COMPOSE_PROJECT", "vexa-compose-gate")  # override on a shared host
 
 # The built services + the host ports they publish. The ports read from the same env vars the
 # compose file interpolates. Routine gates can request dynamic ports so a proof stack can run beside
@@ -50,6 +55,7 @@ MEETING_API_HOST_PORT = _host_port("MEETING_API_PORT", "18080")
 RUNTIME_HOST_PORT = _host_port("RUNTIME_API_PORT", "18090")
 AGENT_API_HOST_PORT = _host_port("AGENT_API_PORT", "18100")
 TERMINAL_HOST_PORT = _host_port("TERMINAL_PORT", "13000")
+MCP_HOST_PORT = _host_port("MCP_HOST_PORT", "18010")
 POSTGRES_HOST_PORT = _host_port("POSTGRES_HOST_PORT", "5458")
 MINIO_HOST_PORT = _host_port("MINIO_HOST_PORT", "9000")
 MINIO_CONSOLE_HOST_PORT = _host_port("MINIO_CONSOLE_HOST_PORT", "9001")
@@ -78,11 +84,30 @@ def docker_available() -> bool:
 requires_docker = pytest.mark.skipif(not docker_available(), reason="docker not available")
 
 
+# Registry-side 5xx (Docker Hub blips) are the one failure class where a blind retry is CORRECT:
+# the command never exercised our code, so retrying cannot mask a product bug. Everything else
+# still fails on the first attempt. (A registry 502 pulling redis:7-alpine killed an
+# otherwise-green pr-value run.)
+_REGISTRY_FLAKE = ("registry-1.docker.io", "Bad Gateway", "Service Unavailable", "TLS handshake timeout")
+
+
+# Optional overlay files (colon-separated paths), e.g. the CI build-cache overlay — appended
+# after the base file so they can only ADD build options, never redefine the stack.
+COMPOSE_EXTRA_FILES = [f for f in os.getenv("COMPOSE_EXTRA_FILES", "").split(":") if f]
+
+
 def _compose(*args: str, env: dict | None = None, check: bool = True, timeout: int = 1200) -> subprocess.CompletedProcess:
     base = ["docker", "compose", "-p", PROJECT, "-f", str(COMPOSE_FILE)]
+    for extra in COMPOSE_EXTRA_FILES:
+        base += ["-f", extra]
     full_env = {**os.environ, **_stack_env(), **(env or {})}
     cmd = base + list(args)
     result = subprocess.run(cmd, capture_output=True, text=True, env=full_env, check=False, timeout=timeout)
+    if result.returncode != 0:
+        blob = (result.stdout or "") + (result.stderr or "")
+        if any(sig in blob for sig in _REGISTRY_FLAKE):
+            time.sleep(20)  # one retry, registry flakes only — see _REGISTRY_FLAKE above
+            result = subprocess.run(cmd, capture_output=True, text=True, env=full_env, check=False, timeout=timeout)
     if check and result.returncode != 0:
         stdout = (result.stdout or "")[-4000:]
         stderr = (result.stderr or "")[-4000:]
@@ -115,6 +140,9 @@ def _stack_env() -> dict:
         "RUNTIME_API_PORT": RUNTIME_HOST_PORT,
         "AGENT_API_PORT": AGENT_API_HOST_PORT,
         "TERMINAL_PORT": TERMINAL_HOST_PORT,
+        # every published host port must be pinned here — a var left out falls through to
+        # deploy/compose/.env (a developer's live stack) and collides with its running ports
+        "MCP_HOST_PORT": MCP_HOST_PORT,
         "POSTGRES_HOST_PORT": POSTGRES_HOST_PORT,
         "MINIO_HOST_PORT": MINIO_HOST_PORT,
         "MINIO_CONSOLE_HOST_PORT": MINIO_CONSOLE_HOST_PORT,
@@ -264,7 +292,7 @@ def _cleanup(s: Stack) -> None:
     # Remove any bot containers the runtime spawned on the HOST daemon (outside the compose project)
     # so `down -v` leaves nothing behind. Scoped to THIS project's network: the runtime attaches every
     # workload to DOCKER_NETWORK=${COMPOSE_PROJECT_NAME}_vexa, and a bare name=^vexa-mtg- would rm -f
-    # ANOTHER stack's live meeting bots on a shared host (the exact bbb-prod-box scenario COMPOSE_PROJECT
+    # ANOTHER stack's live meeting bots on a shared host (the exact shared-host scenario COMPOSE_PROJECT
     # exists for).
     try:
         names = subprocess.run(

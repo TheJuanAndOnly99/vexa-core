@@ -12,10 +12,12 @@ logged, never written into the repo's persisted remote (we strip it afterward, a
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import subprocess
 import time
@@ -72,6 +74,101 @@ def _git(cwd: Path, *args: str, token: str | None = None) -> str:
     return proc.stdout.strip()
 
 
+# ── Lane W: the per-shared-workspace merge-coordinator WRITE point ────────────────────────────────
+# A shared workspace is ONE git repo at <root>/<id> that every member's dispatch mounts (see
+# control_plane/workspace_attach.shared_active_mounts) — NOT a per-member clone. So two members' agent
+# turns commit the SAME repo concurrently, and without serialization their stage+commit race on git's
+# index.lock and a turn's write can be lost (the "concurrent shared writes are not yet serialized"
+# gap in control_plane/dispatch.py). This flock is that serialization point: it gives cross-process
+# mutual exclusion for the commit critical section on ONE node (the shared workspace volume is a POSIX
+# fs, so flock is the right primitive — the same reasoning workspace_membership.py uses for policy/,
+# lifted from a process-local threading.Lock to a cross-process file lock).
+#
+# SCOPE (honest): this makes concurrent commits SAFE (no index corruption / lost turn). It does NOT yet
+# isolate overlapping edits to the SAME entity — two turns editing one file still last-writer-wins at
+# the file level; true per-turn isolation (worktree-per-turn + git three-way on merge) is the next step.
+# MULTI-NODE: an flock is node-local; a multi-replica agent-api additionally needs a shared lock
+# (redis/advisory) or push-as-CAS (documented gap — workspace_membership.py MULTI-REPLICA NOTE).
+WRITE_LOCK_TIMEOUT_S = float(os.environ.get("VEXA_WS_WRITE_LOCK_TIMEOUT_S", "30"))
+
+
+class WorkspaceBusyError(RuntimeError):
+    """The per-workspace write lock could not be acquired within the timeout — the coordinator is busy
+    with another member's commit. Retryable: the caller re-attempts the turn-commit."""
+
+
+@contextlib.contextmanager
+def workspace_write_lock(work_dir: Path, timeout: float = WRITE_LOCK_TIMEOUT_S):
+    """Serialize the commit critical section for the workspace repo at ``work_dir`` across processes on
+    this node (Lane W). Blocks up to ``timeout`` seconds, then raises ``WorkspaceBusyError`` so a wedged
+    holder can never stall a workspace forever (liveness). A no-op-safe wrapper: releases on any exit."""
+    import fcntl  # POSIX-only; imported lazily so non-Linux dev hosts import the module fine
+
+    # Lockfile lives in .git (never staged/committed) when the repo exists, else beside the tree.
+    git_dir = work_dir / ".git"
+    lock_path = (git_dir if git_dir.exists() else work_dir) / ".vexa-writer.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        start = time.monotonic()
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() - start > timeout:
+                    raise WorkspaceBusyError(f"workspace write lock busy after {timeout}s: {work_dir}")
+                time.sleep(0.05)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+class GitPushError(RuntimeError):
+    """A token-authenticated push failed. The message is REDACTED of the token (P15) so it is safe
+    to surface in an API error body / log."""
+
+
+def push_with_token(work_dir: str | Path, remote_url: str, ref: str, token: str | None,
+                    *, remote: str = _PUSH_REMOTE) -> str:
+    """THE shared governed-push mechanic: push ``ref`` to ``remote_url`` over a DEDICATED remote so
+    the repo's ``origin`` is never clobbered. The token (if any) rides on the remote URL for the
+    push's duration ONLY, then the persisted remote is scrubbed back to the token-free URL (P15).
+    Returns the pushed HEAD sha. NEVER forces — a non-fast-forward push fails loud. Failures raise
+    ``GitPushError`` with the token redacted from the message.
+
+    Both credential flows converge here: ``GitHubVcs.push`` (brokered secret store) and the
+    per-call-token workspace publish (``control_plane.workspace_publish``)."""
+    work = Path(work_dir)
+    if token and "://" in remote_url:
+        proto, rest = remote_url.split("://", 1)
+        auth_url = f"{proto}://{token}@{rest}"
+    else:
+        auth_url = remote_url
+
+    def redact(text: str) -> str:
+        return text.replace(token, "***") if token else text
+
+    try:
+        # (Re-)point the dedicated remote at the authenticated URL — `set-url` on a re-publish,
+        # `add` the first time (either may be the one that fails, hence the fallback order).
+        try:
+            _git(work, "remote", "set-url", remote, auth_url, token=token)
+        except RuntimeError:
+            _git(work, "remote", "add", remote, auth_url, token=token)
+        try:
+            _git(work, "push", remote, ref, token=token)
+            return _git(work, "rev-parse", "HEAD", token=token)
+        finally:
+            # Strip the token from the persisted remote so it can't leak to the repo/object store.
+            _git(work, "remote", "set-url", remote, remote_url, token=token)
+    except RuntimeError as exc:
+        raise GitPushError(redact(str(exc))) from None
+
+
 class RealGitWorkspace(WorkspacePort):
     """``WorkspacePort`` backed by real ``git`` on a local working tree.
 
@@ -84,6 +181,9 @@ class RealGitWorkspace(WorkspacePort):
     def __init__(self, work_dir: str | Path) -> None:
         self.work_dir = Path(work_dir)
         self._identity = ("vexa", "vexa@system")  # the parent's commit identity
+        # Paths written this session. Staging is DEFERRED to commit() (under the Lane W write lock) so a
+        # concurrent member's turn on a SHARED repo can't race us on git's index.lock — see write/commit.
+        self._pending: list[str] = []
 
     def clone(self, repo_url: str, ref: str) -> None:
         self.work_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -112,14 +212,35 @@ class RealGitWorkspace(WorkspacePort):
         f = self.work_dir / write.path
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text(render_entity(write))
-        _git(self.work_dir, "add", "--", write.path)
+        # NOTE: deliberately no ``git add`` here. On a SHARED repo, staging grabs .git/index.lock and
+        # would race a concurrent member's turn (proven: writes get dropped with "index.lock: File
+        # exists"). Record the path; commit() stages it under the write lock (Lane W).
+        if write.path not in self._pending:
+            self._pending.append(write.path)
 
     def commit(self, message: str) -> str:
-        # Mirror the parent's "if [ -n "$STATUS" ]" guard: a clean tree → no-op commit returns "".
-        if not _git(self.work_dir, "status", "--porcelain"):
-            return ""
-        _git(self.work_dir, "commit", "-m", message)
-        return _git(self.work_dir, "rev-parse", "HEAD")
+        # Lane W: ALL index mutation (stage + commit) happens under the per-workspace write lock, so a
+        # concurrent member's turn on the SAME shared repo can never race us on git's index.lock.
+        with workspace_write_lock(self.work_dir):
+            paths = list(self._pending)
+            if paths:
+                # Stage + commit ONLY this worker's own paths (pathspec) so a commit carries exactly its
+                # writes — never a concurrent member's half-written file, even sharing one working tree.
+                _git(self.work_dir, "add", "--", *paths)
+                dirty = _git(self.work_dir, "status", "--porcelain", "--", *paths)
+            else:
+                # Back-compat: no deferred writes → fall back to the whole-index behavior (e.g. a caller
+                # that staged externally). Mirrors the parent's "if [ -n "$STATUS" ]" no-op guard.
+                dirty = _git(self.work_dir, "status", "--porcelain")
+            if not dirty:                 # nothing of ours changed vs HEAD → the no-op contract ("")
+                self._pending.clear()
+                return ""
+            if paths:
+                _git(self.work_dir, "commit", "-m", message, "--", *paths)
+            else:
+                _git(self.work_dir, "commit", "-m", message)
+            self._pending.clear()
+            return _git(self.work_dir, "rev-parse", "HEAD")
 
 
 class SecretsBrokerProtocol(Protocol):
@@ -160,20 +281,10 @@ class GitHubVcs(VcsPort):
             "github push subject=%s remote=%s ref=%s token=%r",
             self._subject, remote_url, ref, brokered,  # %r → BrokeredSecret redacts itself
         )
-        if "://" in remote_url:
-            proto, rest = remote_url.split("://", 1)
-            auth_url = f"{proto}://{brokered.reveal()}@{rest}"
-        else:
-            auth_url = remote_url
-        # A dedicated remote so we never clobber the clone's ``origin``; the token lives on it only
-        # for the duration of the push, then we replace it with the token-free URL (P15).
-        _git(work, "remote", "add", _PUSH_REMOTE, auth_url, token=brokered.reveal())
-        try:
-            _git(work, "push", _PUSH_REMOTE, ref, token=brokered.reveal())
-            return _git(work, "rev-parse", "HEAD")
-        finally:
-            # Strip the token from the persisted remote so it can't leak to the repo/object store.
-            _git(work, "remote", "set-url", _PUSH_REMOTE, remote_url)
+        # The one shared governed-push mechanic (push_with_token): dedicated remote so the clone's
+        # ``origin`` is never clobbered, token on the remote URL only for the push's duration, then
+        # scrubbed back to the token-free URL; failure messages token-redacted (P15).
+        return push_with_token(work, remote_url, ref, brokered.reveal(), remote=_PUSH_REMOTE)
 
 
 class RuntimeHttpClient(RuntimePort):
@@ -256,17 +367,28 @@ class RedisStreamReader(StreamReader):
     UnitEvent until a terminal event (``done`` / ``turn-complete``) or an idle give-up. ``redis`` is
     imported LAZILY (the unit tests inject a fake reader)."""
 
-    def __init__(self, redis_url: str, *, block_ms: int = 30000, idle_giveup_ms: int = 120000) -> None:
+    def __init__(self, redis_url: str, *, block_ms: int = 15000, idle_giveup_ms: int = 600000) -> None:
+        # ``block_ms`` doubles as the KEEPALIVE cadence: every empty blocking read yields a ``None``
+        # tick that the SSE layer turns into a ``: keepalive`` comment, so a byte-quiet stream (a long
+        # agent think) is never cut by proxies/clients that drop silent connections (~18-30s observed).
+        # With bytes flowing the giveup can honestly cover a long think instead of racing the proxy.
         self._url = redis_url
         self._block = block_ms
         self._giveup = idle_giveup_ms
 
-    def read(self, unit_id: str):
+    def read(self, unit_id: str, *, resume: str | None = None):
         import redis
 
         client = redis.from_url(self._url, decode_responses=True)
         topic = f"unit:{unit_id}:out"
-        last_id = "$"  # only events from now on — never replay a prior turn's stream
+        # ``resume`` is normally set: the chat handler passes the pre-dispatch tail snapshot on a fresh
+        # turn (attaching at ``$`` AFTER dispatching raced the worker — the 'Reconnecting' hang) and the
+        # cursor on a reconnect. ``$`` (events from now on) is only the no-cursor fallback.
+        # Reconnect → the client's last-seen Stream id
+        # (Last-Event-ID): XREAD gaplessly delivers everything published while the reader was gone —
+        # crucial when a per-dispatch worker cold-starts AFTER the SSE dropped (the false 'No chat
+        # output arrived' failure was the reader giving up / the stream ending before any resume).
+        last_id = resume or "$"
         waited = 0
         while True:
             resp = client.xread({topic: last_id}, count=50, block=self._block)
@@ -274,13 +396,15 @@ class RedisStreamReader(StreamReader):
                 waited += self._block
                 if waited >= self._giveup:
                     return
+                yield None  # idle tick → SSE ``: keepalive`` comment (bytes keep flowing mid-think)
                 continue
             waited = 0
             for _stream, entries in resp:
                 for entry_id, fields in entries:
                     last_id = entry_id
                     ev = json.loads(fields.get("event", "{}"))
-                    yield ev
+                    # Surface the Stream id as the SSE cursor (``id:``) so a dropped view resumes here.
+                    yield (ev, entry_id)
                     # `turn-complete` is the worker's terminal marker — it comes AFTER `done` + `commit`,
                     # so stopping on `done` would drop the commit. Close the view only on turn-complete.
                     if ev.get("type") == "turn-complete":
@@ -318,4 +442,95 @@ class SchedulerHttpClient(SchedulerPort):
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 return None
+            raise
+
+
+class AdminApiMembershipIndex:
+    """A ``MembershipIndex`` (control_plane.workspace_membership) over the identity admin-api's internal
+    edge — the DERIVED ``users.data.memberships[]`` mirror of the authoritative ``policy/members.json``.
+
+    agent-api has no DB; the memberships index lives in the identity service's Postgres. This adapter
+    POSTs the mirror updates over the admin-api's internal tier (``X-Internal-Secret``, same shape as the
+    gateway→admin-api authz oracle). Best-effort by contract: the caller catches and logs failures — the
+    git file is the recovery source (Q6), so a down index never loses a grant. Stdlib urllib (no dep).
+    """
+
+    def __init__(self, base_url: str, internal_secret: str, *, timeout: float = 10.0) -> None:
+        self._base = base_url.rstrip("/")
+        self._secret = internal_secret
+        self._timeout = timeout
+
+    def _headers(self) -> dict[str, str]:
+        h = {"Content-Type": "application/json"}
+        if self._secret:
+            h["X-Internal-Secret"] = self._secret
+        return h
+
+    def add(self, subject: str, workspace_id: str, role: str, added_at: str) -> None:
+        body = json.dumps({"workspace_id": workspace_id, "role": role, "added_at": added_at}).encode()
+        req = urllib.request.Request(
+            f"{self._base}/internal/users/{subject}/memberships",
+            data=body, headers=self._headers(), method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=self._timeout):
+            pass
+
+    def remove(self, subject: str, workspace_id: str) -> None:
+        req = urllib.request.Request(
+            f"{self._base}/internal/users/{subject}/memberships/{workspace_id}",
+            headers=self._headers(), method="DELETE",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout):
+                pass
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+
+    def list(self, subject: str) -> list[dict]:
+        req = urllib.request.Request(
+            f"{self._base}/internal/users/{subject}/memberships",
+            headers=self._headers(), method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout) as r:
+                data = json.loads(r.read())
+            return data.get("memberships", []) if isinstance(data, dict) else (data or [])
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return []
+            raise
+
+
+class AdminApiModelConfig:
+    """The subject's EFFECTIVE model config (user pref > platform setting, resolved by admin-api's
+    ``/internal/users/{id}/model-config``) over the same internal edge as the membership index.
+
+    Dispatch-time seam for the Settings → Models surface: the returned
+    ``{mode, model, meeting_model, base_url, api_key}`` (all optional) overlays the deployment env
+    defaults in ``build_unit_env``. Best-effort by contract: the caller catches failures and
+    dispatches on env defaults — a down identity service must never block a turn. The ``api_key``
+    is a SECRET riding one internal hop into the worker's brokered env; never log the payload."""
+
+    def __init__(self, base_url: str, internal_secret: str, *, timeout: float = 3.0) -> None:
+        self._base = base_url.rstrip("/")
+        self._secret = internal_secret
+        self._timeout = timeout
+
+    def resolve(self, subject: str) -> dict:
+        headers = {"Content-Type": "application/json"}
+        if self._secret:
+            headers["X-Internal-Secret"] = self._secret
+        req = urllib.request.Request(
+            f"{self._base}/internal/users/{subject}/model-config",
+            headers=headers, method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout) as r:
+                data = json.loads(r.read())
+            models = data.get("models") if isinstance(data, dict) else None
+            return models if isinstance(models, dict) else {}
+        except urllib.error.HTTPError as e:
+            if e.code == 404:  # unknown subject (e.g. a dev default-subject) → env defaults
+                return {}
             raise

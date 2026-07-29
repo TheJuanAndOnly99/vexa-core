@@ -374,3 +374,220 @@ def test_rename_clears_label_and_rejects_unknown_slug(tmp_path):
     assert "name" not in attached_workspaces(root, "u1")["slots"]["seed"]
     with pytest.raises(KeyError):
         rename_workspace(root, "u1", "does-not-exist", "X")
+
+
+# ── the additive mount set (WP-A2.1): activate ADDS without parking, deactivate parks, seed always active ──
+
+from control_plane.workspace_attach import (  # noqa: E402
+    activate_workspace,
+    active_workspaces,
+    deactivate_workspace,
+)
+
+
+def test_activate_adds_to_the_set_without_parking_the_others(tmp_path):
+    """activate is ADDITIVE: the private baseline stays in place (still at <root>/<subject>, still active)
+    and the new workspace joins the set — the swap-park behavior must NOT fire."""
+    root = tmp_path / "workspaces"
+    seed_ws = _seed_active(root, "u1")
+    origin = _make_repo(tmp_path / "origin", "SHARED")
+
+    res = activate_workspace(root, "u1", origin, "main")
+
+    assert res.changed is True and res.cloned is True
+    # the private baseline is UNTOUCHED — still the live tree at <root>/<subject> (NOT parked)
+    assert (seed_ws / "CLAUDE.md").read_text() == "SEED"
+    assert not (root / ".attached" / "u1" / "seed").exists()          # seed was NOT parked
+    # the new workspace materialized in its store slot and joined the set
+    mounts = active_workspaces(root, "u1")
+    slugs = [m.slug for m in mounts]
+    assert slugs[0] == "seed" and res.slug in slugs                   # private first, new one present
+    added = next(m for m in mounts if m.slug == res.slug)
+    assert added.repo == origin and added.role == "private" and added.primary is False
+    assert Path(added.path) == root / ".attached" / "u1" / res.slug   # secondary lives in its slot
+
+
+def test_activate_is_idempotent_and_the_private_baseline_needs_no_activation(tmp_path):
+    root = tmp_path / "workspaces"
+    _seed_active(root, "u1")
+    origin = _make_repo(tmp_path / "origin", "SHARED")
+    slug = activate_workspace(root, "u1", origin, "main").slug
+
+    # re-activating the same repo → no-op (no re-clone), and activating the seed is a no-op too
+    calls: list = []
+    again = activate_workspace(root, "u1", origin, "main", clone=lambda *a, **k: calls.append(a))
+    assert again.changed is False and calls == []
+    assert activate_workspace(root, "u1", None, slug="seed").changed is False
+    # the set is unchanged: exactly {seed, slug}
+    assert [m.slug for m in active_workspaces(root, "u1")] == ["seed", slug]
+
+
+def test_deactivate_parks_the_secondary_without_destroying_it(tmp_path):
+    root = tmp_path / "workspaces"
+    _seed_active(root, "u1")
+    origin = _make_repo(tmp_path / "origin", "SHARED")
+    slug = activate_workspace(root, "u1", origin, "main").slug
+    slot_dir = root / ".attached" / "u1" / slug
+    assert slot_dir.exists()
+
+    res = deactivate_workspace(root, "u1", slug)
+
+    assert res.changed is True
+    assert [m.slug for m in active_workspaces(root, "u1")] == ["seed"]  # dropped from the set
+    assert slot_dir.exists()                                            # tree KEPT (parked), never destroyed
+    # deactivate is idempotent, and re-activating restores WITHOUT a re-clone (the slot is already there)
+    assert deactivate_workspace(root, "u1", slug).changed is False
+    calls: list = []
+    again = activate_workspace(root, "u1", None, slug=slug, clone=lambda *a, **k: calls.append(a))
+    assert again.changed is True and calls == []
+    assert slug in [m.slug for m in active_workspaces(root, "u1")]
+
+
+def test_seed_is_active_by_default_and_can_be_switched_off_and_back_on(tmp_path):
+    root = tmp_path / "workspaces"
+    seed_ws = _seed_active(root, "u1")
+    # never-swapped subject: the set is exactly the private baseline (the seed), marked primary
+    mounts = active_workspaces(root, "u1")
+    assert len(mounts) == 1 and mounts[0].slug == "seed" and mounts[0].primary is True
+    assert mounts[0].write is True and Path(mounts[0].path) == root / "u1"
+
+    # SWITCH THE BASELINE OFF — it leaves the mount set (empty now), but its home tree is UNTOUCHED
+    res = deactivate_workspace(root, "u1", "seed")
+    assert res.changed is True
+    assert active_workspaces(root, "u1") == []                         # the turn carries no private mount
+    assert (seed_ws / "CLAUDE.md").read_text() == "SEED"              # durable memory root never destroyed
+    assert deactivate_workspace(root, "u1", "seed").changed is False  # idempotent (already off)
+
+    # SWITCH IT BACK ON — re-activating the baseline clears the flag; it returns as primary, first
+    back = activate_workspace(root, "u1", None, slug="seed")
+    assert back.changed is True
+    mounts = active_workspaces(root, "u1")
+    assert [m.slug for m in mounts] == ["seed"] and mounts[0].primary is True
+
+
+def test_active_set_survives_a_swap_of_the_primary(tmp_path):
+    """A swap only re-homes the PRIVATE baseline; secondary active members must survive it."""
+    root = tmp_path / "workspaces"
+    _seed_active(root, "u1")
+    shared = _make_repo(tmp_path / "shared", "SHARED")
+    other = _make_repo(tmp_path / "other", "OTHER")
+    shared_slug = activate_workspace(root, "u1", shared, "main").slug
+
+    # swap the PRIMARY to `other` — the secondary `shared` stays active
+    swap_workspace(root, "u1", other, "main")
+    slugs = [m.slug for m in active_workspaces(root, "u1")]
+    assert slugs[0] != "seed"                                          # primary is now `other`
+    assert shared_slug in slugs                                       # the secondary survived the swap
+    assert next(m for m in active_workspaces(root, "u1") if m.slug == slugs[0]).primary is True
+
+
+def test_active_set_back_compat_when_state_has_no_active_set_field(tmp_path):
+    """A state.json written before active_set existed → the set is just the single active workspace."""
+    root = tmp_path / "workspaces"
+    _seed_active(root, "u1")
+    origin = _make_repo(tmp_path / "origin", "CUSTOM")
+    slug = swap_workspace(root, "u1", origin, "main").active_slug     # legacy single-active swap
+    # simulate a legacy (pre-flat) state.json: drop the active_set field AND the flat-model marker, so the
+    # migration re-derives the set from the single active workspace (the seed-slot occupant).
+    import json as _json
+    sf = root / ".attached" / "u1" / "state.json"
+    data = _json.loads(sf.read_text()); data.pop("active_set", None); data.pop("_flat_v1", None); sf.write_text(_json.dumps(data))
+
+    mounts = active_workspaces(root, "u1")
+    assert [m.slug for m in mounts] == [slug] and mounts[0].primary is True
+
+
+# ── create a brand-new BLANK workspace (additive "new workspace" — replaces list-level 'start fresh') ──
+
+from control_plane.workspace_attach import create_workspace  # noqa: E402
+
+
+def test_create_new_seeds_a_fresh_workspace_and_adds_it_without_touching_the_baseline(tmp_path, monkeypatch):
+    """'New workspace' CREATES a fresh template-seeded workspace at a NEW slug and ADDS it to the active
+    set — the baseline (and any other active workspace) is NOT parked, rebuilt, or backed up."""
+    monkeypatch.setenv("VEXA_WORKSPACE_SEED_DIR", str(_template(tmp_path)))
+    root = tmp_path / "workspaces"
+    seed_ws = _seed_active(root, "u1", "MY-BASELINE")
+    (seed_ws / "kg").mkdir(exist_ok=True)
+    (seed_ws / "kg" / "real.md").write_text("MY REAL WORK")
+
+    res = create_workspace(root, "u1")
+
+    assert res.changed is True and res.cloned is False
+    assert res.slug == "workspace-1"                                    # fresh unique slug
+    # the baseline is UNTOUCHED — still the live tree at <root>/<subject>, its work intact, NOT parked
+    assert (seed_ws / "CLAUDE.md").read_text() == "MY-BASELINE"
+    assert (seed_ws / "kg" / "real.md").read_text() == "MY REAL WORK"
+    assert not (root / ".attached" / "u1" / "seed").exists()           # baseline NOT parked
+    assert not (root / ".attached" / "u1" / "seed-prev").exists()      # nothing backed up
+    # the new workspace was materialized (seeded from the template + git-inited) in its store slot
+    slot = root / ".attached" / "u1" / "workspace-1"
+    assert (slot / "CLAUDE.md").read_text() == "TEMPLATE ROOT"
+    assert (slot / ".git").exists()
+    # …and JOINED the active set (checked/active), baseline stays primary + first
+    mounts = active_workspaces(root, "u1")
+    slugs = [m.slug for m in mounts]
+    assert slugs[0] == "seed" and mounts[0].primary is True            # baseline still primary
+    added = next(m for m in mounts if m.slug == "workspace-1")
+    assert added.repo is None and added.role == "private" and added.primary is False
+    assert Path(added.path) == slot
+    assert attached_workspaces(root, "u1")["slots"]["workspace-1"]["name"] == "New workspace"
+
+
+def test_create_new_mints_unique_slugs_and_names(tmp_path, monkeypatch):
+    """Each create gets a distinct slug (workspace-1, -2, …) and a soft-unique default name."""
+    monkeypatch.setenv("VEXA_WORKSPACE_SEED_DIR", str(_template(tmp_path)))
+    root = tmp_path / "workspaces"
+    _seed_active(root, "u1")
+
+    a = create_workspace(root, "u1")
+    b = create_workspace(root, "u1")
+
+    assert {a.slug, b.slug} == {"workspace-1", "workspace-2"}
+    view = attached_workspaces(root, "u1")
+    names = {view["slots"]["workspace-1"]["name"], view["slots"]["workspace-2"]["name"]}
+    assert names == {"New workspace", "New workspace 2"}
+    # both joined the set alongside the untouched baseline
+    assert [m.slug for m in active_workspaces(root, "u1")] == ["seed", "workspace-1", "workspace-2"]
+
+
+def test_create_new_honors_a_given_name(tmp_path, monkeypatch):
+    monkeypatch.setenv("VEXA_WORKSPACE_SEED_DIR", str(_template(tmp_path)))
+    root = tmp_path / "workspaces"
+    _seed_active(root, "u1")
+
+    res = create_workspace(root, "u1", name="Research")
+
+    assert attached_workspaces(root, "u1")["slots"][res.slug]["name"] == "Research"
+
+
+def test_create_new_does_not_park_or_disturb_an_existing_active_secondary(tmp_path, monkeypatch):
+    """Creating a new workspace leaves ALREADY-active secondaries (activated repos) mounted + in place."""
+    monkeypatch.setenv("VEXA_WORKSPACE_SEED_DIR", str(_template(tmp_path)))
+    root = tmp_path / "workspaces"
+    _seed_active(root, "u1")
+    shared = _make_repo(tmp_path / "shared", "SHARED")
+    shared_slug = activate_workspace(root, "u1", shared, "main").slug
+
+    res = create_workspace(root, "u1")
+
+    slugs = [m.slug for m in active_workspaces(root, "u1")]
+    assert slugs == ["seed", shared_slug, res.slug]                    # both survive; new one appended
+    # the pre-existing secondary's tree is untouched
+    assert (root / ".attached" / "u1" / shared_slug / "MARK").read_text() == "SHARED"
+
+
+def test_create_new_slug_skips_a_taken_workspace_n_slug(tmp_path, monkeypatch):
+    """Slug minting avoids colliding with an existing slot that happens to already use a workspace-N name."""
+    monkeypatch.setenv("VEXA_WORKSPACE_SEED_DIR", str(_template(tmp_path)))
+    root = tmp_path / "workspaces"
+    _seed_active(root, "u1")
+    # pre-seed the state with a slot already named workspace-1 (e.g. a parked repo carrying that slug)
+    store = root / ".attached" / "u1"
+    store.mkdir(parents=True, exist_ok=True)
+    import json as _json
+    (store / "state.json").write_text(_json.dumps(
+        {"active": None, "slots": {"workspace-1": {"repo": "x", "ref": "main"}}, "active_set": []}))
+
+    res = create_workspace(root, "u1")
+    assert res.slug == "workspace-2"                                    # skipped the taken workspace-1

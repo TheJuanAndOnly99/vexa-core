@@ -7,6 +7,7 @@
  *  toggles, two domains — composed into one op. Partial failure is SURFACED in the returned state, never
  *  swallowed (P18). */
 import { ApiError, getJson } from "./apiClient";
+import { defaultBotName } from "./defaultBotName";
 
 export interface AgentOnMeetingInput {
   platform: string; // e.g. "google_meet"
@@ -33,15 +34,17 @@ function meetingUrlFor(platform: string, native: string, given?: string): string
  *  the meeting and the raw transcript still flows), never swallowed. */
 export async function agentOnMeeting(input: AgentOnMeetingInput): Promise<AgentOnMeetingState> {
   const { platform, native_id } = input;
-  // Step 1 — MEETINGS domain: send the bot (POST /bots through the gateway edge).
-  const bot = await getJson<{ status?: string }>("/api/bots", {
+  // Step 1 — MEETINGS domain: send the bot (POST /bots through the gateway edge). The response carries
+  // the meetings-domain ROW id (`id`) — passed to /api/meeting/process below so the copilot's opt-in
+  // flag / cursor / processed stream key on the row id (P0 cross-tenant leak fix), never the native.
+  const bot = await getJson<{ status?: string; id?: number | string }>("/api/bots", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       platform,
       native_meeting_id: native_id,
       meeting_url: meetingUrlFor(platform, native_id, input.meeting_url),
-      bot_name: input.bot_name ?? "Vexa",
+      bot_name: input.bot_name ?? defaultBotName(),
     }),
   });
   // Step 2 — AGENT domain: enable the copilot (POST /api/meeting/process). Surface a failure, don't throw.
@@ -50,7 +53,7 @@ export async function agentOnMeeting(input: AgentOnMeetingInput): Promise<AgentO
     const proc = await getJson<{ resumed_from?: string }>("/api/meeting/process", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ native_id, platform, on: true }),
+      body: JSON.stringify({ native_id, platform, on: true, meeting_id: bot.id != null ? String(bot.id) : undefined }),
     });
     copilot = { enabled: true, resumed_from: proc.resumed_from };
   } catch (e) {

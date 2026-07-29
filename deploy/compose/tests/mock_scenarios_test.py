@@ -43,10 +43,15 @@ def _spawn(stack, user_id, scenario, *, native_id=None, max_bots=5):
     # before any FSM runs. The mock fakes the pipeline and emits its transcript segments regardless,
     # so every dataflow assertion below still proves the collector path.
     native_id = native_id or f"mk-{scenario}-{uuid.uuid4().hex[:6]}"
+    payload = {
+        "platform": "google_meet", "native_meeting_id": native_id, "bot_name": f"mock:{scenario}",
+        "transcribe_enabled": False,
+    }
+    if scenario == "silence-left-alone":
+        payload["automatic_leave"] = {"max_time_left_alone": 250}
     code, body = post_json(
         f"{stack.meeting_api}/bots",
-        {"platform": "google_meet", "native_meeting_id": native_id, "bot_name": f"mock:{scenario}",
-         "transcribe_enabled": False},
+        payload,
         headers={"x-user-id": str(user_id), "x-user-limits": str(max_bots)},
     )
     assert code == 201, f"POST /bots mock:{scenario} → {code} {body}"
@@ -82,11 +87,19 @@ def _diag(stack, native_id, m):
 
 
 def _seg_count(stack, meeting_id):
-    out = stack.redis_cli("HLEN", f"meeting:{meeting_id}:segments")
+    """Segments visible in durable-or-live stores. Since #53 the db-writer flushes settled
+    segments to postgres and TRIMS the redis hash (completion flush empties it entirely), so the
+    hash alone reads 0 for a completed meeting — the durable truth is postgres + the live tail."""
+    live = durable = 0
     try:
-        return int(out)
+        live = int(stack.redis_cli("HLEN", f"meeting:{meeting_id}:segments"))
     except Exception:
-        return 0
+        pass
+    try:
+        durable = int(stack.psql(f"SELECT count(*) FROM transcriptions WHERE meeting_id = {int(meeting_id)}"))
+    except Exception:
+        pass
+    return live + durable
 
 
 def _stop_bot(stack, user_id, native_id):
@@ -119,7 +132,7 @@ def test_mock_normal_full_lifecycle(stack):
         if segs:
             break
         time.sleep(2)
-    assert segs >= 1, f"normal published no transcript segments (hash empty for meeting {m['id']})"
+    assert segs >= 1, f"normal published no transcript segments (redis hash AND postgres empty for meeting {m['id']})"
 
     # recording leg: the mock uploaded a chunk → it landed in minio under this user.
     deadline = time.time() + 20
@@ -131,6 +144,20 @@ def test_mock_normal_full_lifecycle(stack):
         time.sleep(2)
     assert keys, f"normal recording chunk not in minio for user {user_id}"
     print(f"\n[mock/normal] completed · {segs} transcript seg(s) · recording in minio ({len(keys)} obj)")
+
+
+# ── silence-left-alone: automatic_leave → invocation → real monitor → lifecycle terminal ─────────
+
+@mock_only
+def test_mock_silence_left_alone(stack):
+    user_id = _create_user(stack, max_bots=5)
+    native_id, _ = _spawn(stack, user_id, "silence-left-alone")
+    m = _wait_meeting(stack, user_id, native_id, statuses=TERMINAL, timeout=60, poll=0.25)
+    if not m or m["status"] not in TERMINAL:
+        _diag(stack, native_id, m)
+    assert m and m["status"] == "completed", f"silence-left-alone did not complete: {m}"
+    assert m["reason"] == "left_alone", f"silence-left-alone reason={m['reason']!r}"
+    print("\n[mock/silence-left-alone] automatic_leave → completed(left_alone)")
 
 
 # ── reject / crash / timeout: failed + attributable reason (P18) ───────────────────────────────────
@@ -250,8 +277,13 @@ def test_mock_speak_ack(stack):
     deadline = time.time() + 25
     spoke = False
     while time.time() < deadline:
+        # The db-writer (#53) may have already flushed the marker to postgres and trimmed the
+        # hash between polls — the durable truth is hash OR transcriptions row.
         vals = stack.redis_cli("HVALS", f"meeting:{m['id']}:segments")
-        if "[mock spoke" in vals:
+        durable = stack.psql(
+            f"SELECT count(*) FROM transcriptions WHERE meeting_id = {int(m['id'])} AND text LIKE '%[mock spoke%'"
+        )
+        if "[mock spoke" in vals or (durable.strip().isdigit() and int(durable) >= 1):
             spoke = True
             break
         time.sleep(2)

@@ -5,13 +5,25 @@
  *  lists, links (new tab, rel noreferrer), [[wikilinks]], blockquotes, horizontal rules,
  *  GFM pipe tables, paragraphs and line breaks. Intentionally a small subset — robust,
  *  not spec-complete. */
+"use client";
 import { Fragment, type ReactNode } from "react";
-import { OPEN_ENTITY_EVENT } from "../canvas/actions";
+import { Card, CardGroup, InternalLink, Wikilink, isInternalHref, useOpenEntity } from "./docLinks";
 
-// An entity-doc path (e.g. kg/entities/person/dmitry-grankin.md) → clickable to open the doc.
-const ENTITY_PATH = /^[\w./-]*kg\/entities\/[\w./-]+\.md$/;
-function openEntity(detail: { path?: string; wikilink?: string }): void {
-  if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent(OPEN_ENTITY_EVENT, { detail }));
+// A workspace-doc path in inline code → clickable to open the doc. Matches kg/ docs by any
+// spelling the agent uses (relative `kg/entities/x.md` or the verbatim absolute mount path
+// `<root>/<subject>/kg/...`) plus any doc inside an attached-workspace mount
+// (`<root>/.attached/<subject>/<slug>/...md`) — resolveDocRef translates all of them.
+const ENTITY_PATH = /^(?:(?:[\w./-]*\/)?kg\/[\w./-]+\.md|\/[\w./-]*\.attached\/[\w./-]+\.md)$/;
+// Clickable `kg/entities/...` inline code — a component so it can read the doc's
+// workspace context (DocMeta/DocNav) via useOpenEntity, same as every other link.
+function EntityCode({ code }: { code: string }) {
+  const openEntity = useOpenEntity();
+  return (
+    <code onClick={() => openEntity({ path: code })}
+      style={{ fontFamily: "var(--mono)", fontSize: "0.88em", background: "var(--panel2)", border: "1px solid var(--line)", borderRadius: 4, padding: "0.5px 5px", color: "var(--blue)", cursor: "pointer" }}>
+      {code}
+    </code>
+  );
 }
 
 // ── inline span parsing: code, bold, italic, links, wikilinks ──────────────────────
@@ -23,12 +35,12 @@ function inline(text: string): ReactNode[] {
   codeParts.forEach((seg, ci) => {
     if (seg.startsWith("`") && seg.endsWith("`") && seg.length >= 2) {
       const code = seg.slice(1, -1);
-      const isPath = ENTITY_PATH.test(code);
-      out.push(
-        <code key={`c${ci}`} onClick={isPath ? () => openEntity({ path: code }) : undefined}
-          style={{ fontFamily: "var(--mono)", fontSize: "0.88em", background: "var(--panel2)", border: "1px solid var(--line)", borderRadius: 4, padding: "0.5px 5px", color: isPath ? "var(--blue)" : "var(--t1)", cursor: isPath ? "pointer" : undefined }}>
-          {code}
-        </code>,
+      out.push(ENTITY_PATH.test(code)
+        ? <EntityCode key={`c${ci}`} code={code} />
+        : <code key={`c${ci}`}
+            style={{ fontFamily: "var(--mono)", fontSize: "0.88em", background: "var(--panel2)", border: "1px solid var(--line)", borderRadius: 4, padding: "0.5px 5px", color: "var(--t1)" }}>
+            {code}
+          </code>,
       );
     } else {
       emphasis(seg, `${ci}`, out);
@@ -47,27 +59,61 @@ function emphasis(text: string, key: string, out: ReactNode[]): void {
     if (m.index > last) out.push(<Fragment key={`${key}-t${i}`}>{text.slice(last, m.index)}</Fragment>);
     const tok = m[0];
     if (m[1]) {
-      // [[wikilink]] — clickable: resolve the title to its entity doc
-      out.push(<span key={`${key}-w${i}`} onClick={() => openEntity({ wikilink: tok.slice(2, -2) })} style={{ color: "var(--blue)", cursor: "pointer" }}>{tok}</span>);
+      // [[wikilink]] — the same typed entity chip MdxDoc renders (shared resolver; a
+      // title with no entity doc renders muted + tooltip instead of a dead click)
+      out.push(<Wikilink key={`${key}-w${i}`} title={tok.slice(2, -2)} />);
     } else if (m[2]) {
-      // [text](url)
+      // [text](url) — workspace-internal (schemeless) hrefs navigate in place, resolving
+      // relative paths against the linking doc; external links open a browser tab
       const lm = tok.match(/^\[([^\]]*)\]\(([^)]+)\)$/)!;
-      out.push(
-        <a key={`${key}-l${i}`} href={lm[2]} target="_blank" rel="noreferrer noopener" style={{ color: "var(--blue)", textDecoration: "underline" }}>
-          {lm[1] || lm[2]}
-        </a>,
+      out.push(isInternalHref(lm[2])
+        ? <InternalLink key={`${key}-l${i}`} href={lm[2]}>{lm[1] || lm[2]}</InternalLink>
+        : <a key={`${key}-l${i}`} href={/^https?:/i.test(lm[2]) || lm[2].startsWith("#") ? lm[2] : undefined} target="_blank" rel="noreferrer noopener" style={{ color: "var(--blue)", textDecoration: "underline" }}>
+            {lm[1] || lm[2]}
+          </a>,
       );
     } else if (m[3]) {
-      // **bold** / __bold__
-      out.push(<strong key={`${key}-b${i}`} style={{ fontWeight: 600, color: "var(--t1)" }}>{tok.slice(2, -2)}</strong>);
+      // **bold** / __bold__ — recurse so **[[wikilink]]** renders the chip, not literal brackets
+      const inner: ReactNode[] = [];
+      emphasis(tok.slice(2, -2), `${key}-b${i}`, inner);
+      out.push(<strong key={`${key}-b${i}`} style={{ fontWeight: 600, color: "var(--t1)" }}>{inner}</strong>);
     } else if (m[4]) {
-      // *italic* / _italic_
-      out.push(<em key={`${key}-i${i}`} style={{ fontStyle: "italic" }}>{tok.slice(1, -1)}</em>);
+      // *italic* / _italic_ — recurse for the same reason
+      const innerI: ReactNode[] = [];
+      emphasis(tok.slice(1, -1), `${key}-i${i}`, innerI);
+      out.push(<em key={`${key}-i${i}`} style={{ fontStyle: "italic" }}>{innerI}</em>);
     }
     last = re.lastIndex;
     i++;
   }
   if (last < text.length) out.push(<Fragment key={`${key}-t${i}`}>{text.slice(last)}</Fragment>);
+}
+
+// ── <Card>/<CardGroup> fallback parity ─────────────────────────────────────────────
+// This renderer is where docs land when their MDX compile FAILS, and agent-written docs
+// use the Mintlify card vocabulary heavily — without this, every failed doc prints
+// `<CardGroup cols={2}>` as literal text. Parse just those two tags (string/number
+// attributes only, matching MdxDoc's no-expressions rule) and render the SAME Card /
+// CardGroup components from ./docLinks.
+export interface ParsedCard { title?: string; icon?: string; href?: string; body: string }
+export interface ParsedCardBlock { cols: number; grouped: boolean; cards: ParsedCard[] }
+const CARD_BLOCK_START = /^\s*<Card(Group)?\b/;
+function parseCardAttrs(attrs: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const m of attrs.matchAll(/(\w+)\s*=\s*(?:"([^"]*)"|'([^']*)'|\{\s*(\d+)\s*\})/g))
+    out[m[1]] = m[2] ?? m[3] ?? m[4];
+  return out;
+}
+/** Parse one card block's source (a <CardGroup>…</CardGroup> or bare <Card>s). Exported for tests. */
+export function parseCardBlock(src: string): ParsedCardBlock {
+  const group = src.match(/<CardGroup\b([^>]*)>/);
+  const cols = group ? Number(parseCardAttrs(group[1]).cols) || 2 : 2;
+  const cards: ParsedCard[] = [];
+  for (const m of src.matchAll(/<Card\b([^>]*?)(\/>|>([\s\S]*?)<\/Card>)/g)) {
+    const a = parseCardAttrs(m[1]);
+    cards.push({ title: a.title, icon: a.icon, href: a.href, body: (m[3] ?? "").trim() });
+  }
+  return { cols, grouped: Boolean(group), cards };
 }
 
 const HEADING_SIZE: Record<number, number> = { 1: 18, 2: 16, 3: 14.5, 4: 13.5 };
@@ -210,6 +256,28 @@ export function Markdown({ children, style }: { children: string; style?: React.
       continue;
     }
 
+    // <Card> / <CardGroup> block — same card UI MdxDoc renders (fallback parity)
+    if (CARD_BLOCK_START.test(line)) {
+      const isGroup = /^\s*<CardGroup\b/.test(line);
+      const closeRe = isGroup ? /<\/CardGroup>/ : /(\/>\s*$|<\/Card>)/;
+      const buf: string[] = [lines[i]];
+      i++;
+      while (i < lines.length && !closeRe.test(buf[buf.length - 1])) { buf.push(lines[i]); i++; }
+      const parsed = parseCardBlock(buf.join("\n"));
+      if (parsed.cards.length === 0) {
+        // not actually card markup (e.g. a lone unclosed tag) — show it as literal text
+        blocks.push(<p key={key++} style={{ margin: "0 0 8px", lineHeight: 1.6 }}>{inline(buf.join(" "))}</p>);
+        continue;
+      }
+      const rendered = parsed.cards.map((c, j) => (
+        <Card key={j} title={c.title} icon={c.icon} href={c.href}>{c.body ? inline(c.body.replace(/\s*\n\s*/g, " ")) : undefined}</Card>
+      ));
+      blocks.push(parsed.grouped
+        ? <CardGroup key={key++} cols={parsed.cols}>{rendered}</CardGroup>
+        : <div key={key++} style={{ display: "flex", flexDirection: "column", gap: 10, margin: "8px 0 12px" }}>{rendered}</div>);
+      continue;
+    }
+
     // GFM pipe table
     const table = tableStart(lines, i);
     if (table) {
@@ -250,7 +318,7 @@ export function Markdown({ children, style }: { children: string; style?: React.
 
     // paragraph — gather consecutive plain lines until a blank or a block starter
     const para: string[] = [];
-    while (i < lines.length && !/^\s*$/.test(lines[i]) && !/^\s*```/.test(lines[i]) && !/^(#{1,4})\s+/.test(lines[i]) && !/^\s*>/.test(lines[i]) && !/^\s*[-*]\s+/.test(lines[i]) && !/^\s*\d+[.)]\s+/.test(lines[i]) && !/^\s*([-*_])(\s*\1){2,}\s*$/.test(lines[i]) && !tableStart(lines, i)) {
+    while (i < lines.length && !/^\s*$/.test(lines[i]) && !/^\s*```/.test(lines[i]) && !/^(#{1,4})\s+/.test(lines[i]) && !/^\s*>/.test(lines[i]) && !/^\s*[-*]\s+/.test(lines[i]) && !/^\s*\d+[.)]\s+/.test(lines[i]) && !/^\s*([-*_])(\s*\1){2,}\s*$/.test(lines[i]) && !CARD_BLOCK_START.test(lines[i]) && !tableStart(lines, i)) {
       para.push(lines[i]); i++;
     }
     blocks.push(

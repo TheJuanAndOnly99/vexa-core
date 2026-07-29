@@ -1,16 +1,17 @@
 "use client";
-/** API Tokens — the logged-in user's token self-serve LIST (left): list, mint, revoke.
- *
- *  Registers in EVERY terminal mode (it's the settings surface meetings-only deployments need to get
- *  programmatic API access). All data flows through /api/tokens, which resolves the user server-side
- *  from the auth cookies — no user_id ever leaves this component (P20). The minted token value is
- *  shown ONCE (copy it now); it is never listed again.
+/** API tokens + GitHub token panels — the user's credential self-serve (list, mint, revoke; save-once
+ *  PAT). These render inside the SETTINGS tab (surfaces/settings.tsx — the footer-gear surface,
+ *  design-spec meeting-lifecycle-v2 W5); the old "API Tokens" activity-bar item is retired so
+ *  integrator config leaves the daily-driver nav. All data flows through /api/tokens, which resolves
+ *  the user server-side from the auth cookies — no user_id ever leaves this component (P20). The
+ *  minted token value is shown ONCE (copy it now); it is never listed again.
  */
 import { useCallback, useEffect, useState } from "react";
-import { registerList } from "../contributions";
 import { Icon } from "../ui-kit";
 import { copyText } from "../ui-kit/ContextMenu";
 import { listTokens, createToken, revokeToken, TOKEN_SCOPES, type TokenInfo, type TokenScope, type MintedToken } from "./tokensApi";
+import { getGitToken, setGitToken, type SavedGitToken } from "./workspaceApi";
+import { presentError } from "./apiClient";
 
 const EXPIRIES: Array<{ label: string; seconds?: number }> = [
   { label: "never expires" },
@@ -21,6 +22,10 @@ const EXPIRIES: Array<{ label: string; seconds?: number }> = [
 ];
 
 const fmtDate = (iso?: string | null) => (iso ? new Date(iso).toLocaleDateString() : null);
+
+// Scopes speak CAPABILITIES to the user (the raw scope id rides in the tooltip + the API).
+const SCOPE_LABELS: Record<string, string> = { bot: "Join meetings", tx: "Read transcripts", browser: "Browse web" };
+const scopeLabel = (s: string) => SCOPE_LABELS[s] ?? s;
 
 function TokenRow({ token, onRevoke }: { token: TokenInfo; onRevoke: (id: number) => void }) {
   const [confirming, setConfirming] = useState(false);
@@ -34,12 +39,12 @@ function TokenRow({ token, onRevoke }: { token: TokenInfo; onRevoke: (id: number
           {token.name || `token #${token.id}`}
         </div>
         <div style={{ fontSize: 11, color: "var(--t3)" }}>
-          {token.scopes.join(" · ")}{created ? ` · created ${created}` : ""}{expires ? ` · expires ${expires}` : ""}
+          {token.scopes.map(scopeLabel).join(" · ")}{created ? ` · created ${created}` : ""}{expires ? ` · expires ${expires}` : ""}
         </div>
       </div>
       {confirming ? (
         <>
-          <button onClick={() => onRevoke(token.id)} style={{ background: "none", border: "none", color: "var(--live)", cursor: "pointer", fontSize: 11.5, padding: 2 }}>revoke</button>
+          <button onClick={() => onRevoke(token.id)} style={{ background: "none", border: "none", color: "var(--danger)", cursor: "pointer", fontSize: 11.5, padding: 2 }}>revoke</button>
           <button onClick={() => setConfirming(false)} style={{ background: "none", border: "none", color: "var(--t3)", cursor: "pointer", fontSize: 11.5, padding: 2 }}>keep</button>
         </>
       ) : (
@@ -90,7 +95,7 @@ function CreateTokenForm({ onCreated }: { onCreated: (t: MintedToken) => void })
       setName("");
       onCreated(minted);
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));  // fail-loud (P18)
+      setError(presentError(e).headline);  // fail-loud (P18)
     } finally {
       setBusy(false);
     }
@@ -102,15 +107,15 @@ function CreateTokenForm({ onCreated }: { onCreated: (t: MintedToken) => void })
       <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Name (optional)" style={{ ...field, marginBottom: 8 }} />
       <div style={{ display: "flex", gap: 10, marginBottom: 8 }}>
         {TOKEN_SCOPES.map((s) => (
-          <label key={s} style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "var(--t2)", cursor: "pointer" }}>
-            <input type="checkbox" checked={scopes.includes(s)} onChange={() => toggle(s)} />{s}
+          <label key={s} title={`scope: ${s}`} style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "var(--t2)", cursor: "pointer" }}>
+            <input type="checkbox" checked={scopes.includes(s)} onChange={() => toggle(s)} />{scopeLabel(s)}
           </label>
         ))}
       </div>
       <select value={expiryIdx} onChange={(e) => setExpiryIdx(Number(e.target.value))} style={{ ...field, marginBottom: 8 }}>
         {EXPIRIES.map((e, i) => <option key={e.label} value={i}>{e.label}</option>)}
       </select>
-      {error && <div role="alert" style={{ fontSize: 11.5, color: "var(--live)", marginBottom: 8 }}>⚠ {error}</div>}
+      {error && <div role="alert" style={{ fontSize: 11.5, color: "var(--danger)", marginBottom: 8 }}>⚠ {error}</div>}
       <button onClick={() => void submit()} disabled={busy || scopes.length === 0}
         style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12, padding: "4px 10px", borderRadius: 6, border: "1px solid var(--line)", background: "var(--panel2)", color: "var(--t1)", cursor: busy || scopes.length === 0 ? "default" : "pointer", opacity: busy || scopes.length === 0 ? 0.6 : 1 }}>
         <Icon name="plus" size={12} />{busy ? "creating…" : "Create token"}
@@ -119,25 +124,87 @@ function CreateTokenForm({ onCreated }: { onCreated: (t: MintedToken) => void })
   );
 }
 
-function TokensList() {
+/** The SAVE-ONCE reusable GitHub token (git_credentials). Stored server-side; the clear value is never
+ *  shown again (only a ••••abcd mask). Applied as the fallback credential for push / pull / publish /
+ *  attach across ALL of the user's repos, so they don't re-enter it per repo. */
+export function GitHubTokenCard() {
+  const [state, setState] = useState<SavedGitToken | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(() => {
+    void getGitToken().then((s) => { setState(s); setError(null); }).catch((e: unknown) => setError(presentError(e).headline));
+  }, []);
+  useEffect(() => refresh(), [refresh]);
+
+  const save = async () => {
+    if (!value.trim() || busy) return;
+    setBusy(true); setError(null);
+    try { const s = await setGitToken(value.trim()); setState(s); setValue(""); setEditing(false); }
+    catch (e: unknown) { setError(presentError(e).headline); }
+    finally { setBusy(false); }
+  };
+  const clear = async () => {
+    setBusy(true); setError(null);
+    try { const s = await setGitToken(null); setState(s); setValue(""); setEditing(false); }
+    catch (e: unknown) { setError(presentError(e).headline); }
+    finally { setBusy(false); }
+  };
+
+  const field = { width: "100%", fontSize: 12, padding: "6px 8px", borderRadius: 6, border: "1px solid var(--line)", background: "var(--panel2)", color: "var(--t1)" } as const;
+  const btn = { fontSize: 12, padding: "5px 12px", borderRadius: 6, border: "1px solid var(--line)", background: "var(--panel2)", color: "var(--t1)", cursor: "pointer" } as const;
+  const showForm = editing || (state !== null && !state.set);
+
+  return (
+    <div style={{ margin: "4px 4px 14px", padding: 10, borderRadius: 8, border: "1px solid var(--line)" }}>
+      <div style={{ fontSize: 12.5, color: "var(--t1)", marginBottom: 3 }}>GitHub token</div>
+      <div style={{ fontSize: 11, color: "var(--t3)", lineHeight: 1.45, marginBottom: 9 }}>
+        Saved once and reused for push · pull · publish · attach across all your repos. Stored server-side —
+        never shown again. Use a fine-grained, minimally-scoped PAT you can revoke on GitHub anytime.
+      </div>
+      {error && <div role="alert" style={{ fontSize: 11.5, color: "var(--danger)", marginBottom: 8 }}>⚠ {error}</div>}
+      {state?.set && !showForm && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <Icon name="key" size={13} style={{ color: "var(--accent)" }} />
+          <span style={{ flex: 1, fontSize: 12.5, color: "var(--t2)", fontFamily: "var(--mono)" }}>{state.masked}</span>
+          <button disabled={busy} onClick={() => { setEditing(true); setValue(""); }} style={btn}>Replace</button>
+          <button disabled={busy} onClick={() => void clear()} style={{ ...btn, color: "var(--danger)" }}>Clear</button>
+        </div>
+      )}
+      {showForm && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <input type="password" autoFocus value={value} placeholder="ghp_… (fine-grained PAT)" disabled={busy}
+            onChange={(e) => setValue(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") void save(); if (e.key === "Escape") { setEditing(false); setValue(""); } }} style={field} />
+          <div style={{ display: "flex", gap: 8 }}>
+            <button disabled={busy || !value.trim()} onClick={() => void save()} style={{ ...btn, background: "var(--accent)", color: "var(--on-accent)", border: "none", opacity: busy || !value.trim() ? 0.5 : 1 }}>{busy ? "Saving…" : "Save token"}</button>
+            {state?.set && <button disabled={busy} onClick={() => { setEditing(false); setValue(""); }} style={btn}>Cancel</button>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function TokensPanel() {
   const [tokens, setTokens] = useState<TokenInfo[]>([]);
   const [minted, setMinted] = useState<MintedToken | null>(null);
   const [error, setError] = useState<string | null>(null);  // fail-loud (P18)
 
   const refresh = useCallback(() => {
-    void listTokens().then((t) => { setTokens(t); setError(null); }).catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
+    void listTokens().then((t) => { setTokens(t); setError(null); }).catch((e: unknown) => setError(presentError(e).headline));
   }, []);
   useEffect(() => refresh(), [refresh]);
 
   const onCreated = (t: MintedToken) => { setMinted(t); refresh(); };
   const onRevoke = (id: number) => {
-    void revokeToken(id).then(refresh).catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
+    void revokeToken(id).then(refresh).catch((e: unknown) => setError(presentError(e).headline));
   };
 
   return (
     <div style={{ padding: "8px" }}>
-      <div style={{ fontSize: 11, color: "var(--t3)", textTransform: "uppercase", letterSpacing: ".04em", padding: "6px 4px 4px" }}>api tokens</div>
-      {error && <div role="alert" style={{ fontSize: 12, color: "var(--live)", padding: "6px 9px" }}>⚠ Couldn’t load tokens — {error}</div>}
+      {error && <div role="alert" style={{ fontSize: 12, color: "var(--danger)", padding: "6px 9px" }}>⚠ Couldn’t load tokens — {error}</div>}
       {minted && <MintedTokenCard minted={minted} onDismiss={() => setMinted(null)} />}
       <CreateTokenForm onCreated={onCreated} />
       {tokens.map((t) => <TokenRow key={t.id} token={t} onRevoke={onRevoke} />)}
@@ -145,5 +212,3 @@ function TokensList() {
     </div>
   );
 }
-
-registerList({ id: "tokens", label: "API Tokens", icon: "key", order: 60, component: TokensList });

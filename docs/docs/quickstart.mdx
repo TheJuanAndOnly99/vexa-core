@@ -9,24 +9,33 @@ with one command.
 
 ## Prerequisites
 
-- A Linux host (Ubuntu 24.04 recommended), `git`, and Docker.
+- A Linux host (Ubuntu 24.04 recommended for production), `git`, **`make`**, and **Docker engine ≥ v26**
+  (`make all` checks and refuses older engines). A Mac with Docker Desktop works for a local
+  evaluation — everything runs in containers either way.
+- `make all` **pulls the published, release-validated images** — no build, any modest machine works;
+  `make lite` pulls the single-container all-in-one image and is lighter still. Building from
+  source (`make dev`) is for contributors and wants **8 vCPUs / 16 GB RAM**.
+- On Apple Silicon: arm64 images are published best-effort (not yet CI-validated) — see
+  [Deployment](/deployment#quick-start-docker-compose) for details.
 - A **transcription (STT) token** — get one free at [`vexa.ai/account`](https://vexa.ai/account), or
-  [self-host transcription](/deployment#air-gapped) on a GPU. Without it, bots join and record but
-  produce no transcript.
+  [self-host transcription](/deployment#air-gapped) on a GPU. Default spawns **require** STT and
+  answer `503` when it is unset; capture-only is `{"transcribe_enabled": false}` on `POST /bots`
+  (or `TRANSCRIBE_ENABLED=false` for the whole deployment). See
+  [Configuration](/configuration#transcription-stt).
 
 ## 1. Install and start
 
 ```bash
 curl -fsSL https://get.docker.com | sh
-git clone https://github.com/Vexa-ai/vexa-core.git && cd vexa-core
-make all          # full Docker Compose stack — seeds .env, builds, and prints your API key
-make bot          # build the meeting bot from source — needed before a bot can join (§2′)
+git clone https://github.com/Vexa-ai/vexa.git && cd vexa
+make all          # full Docker Compose stack — pulls the published images (bot included), prints your API key
+                  # contributors: `make dev` builds everything from this checkout instead (:dev tags)
 ```
 
 `make all` brings up the whole stack and **prints an API key + your URLs** when it finishes:
 
 ```text
-  Vexum is up.
+  Vexa is up.
     Terminal UI : http://localhost:13000
     API gateway : http://localhost:18056
     API key     : vxa_…
@@ -39,8 +48,11 @@ make bot          # build the meeting bot from source — needed before a bot ca
 
 <Note>
 `make all` seeds `.env` from `.env.example` on first run and mints a self-host API key for you
-(via `deploy/compose/bin/provision-token`). To add transcription (STT) and an LLM provider, fill the
-credentials block in `.env`. To mint additional scoped keys yourself, see [Authentication](/authentication).
+(via `deploy/compose/bin/provision-token`). **The seeded `.env` ships with every credential empty**
+— `make all` prints a warning box (and ⚠ lines in the banner) until you fill them: the STT pair for
+win 1 (transcripts), one model credential for win 2 (agent chat) — either in `.env` or under
+**Settings → Models** in the Terminal. To mint additional scoped keys yourself, see
+[Authentication](/authentication).
 </Note>
 
 ## 2. First win — capture a meeting (UI)
@@ -94,9 +106,30 @@ curl -N -X POST "$API_BASE/agent/chat" \
 The response streams back as Server-Sent Events — `message-delta` frames carry the reply, `commit`
 frames mark anything the agent recorded. See the [Agent API](/api/agent).
 
+## 4. Third win — connect your calendar
+
+Stop pasting links: give Vexa your calendar's **secret ICS address** (Google Calendar → Settings →
+your calendar → *Integrate calendar* → **Secret address in iCal format**, the `…/private-…/basic.ics`
+one — *not* the public address above it) and every upcoming meeting with a Meet/Zoom/Teams link
+imports on its own — and the bot **auto-joins at start time**. Connecting syncs immediately and
+tells you what it imported; on a Google **Workspace** domain the secret-address field may need a
+one-time admin unlock ([how](/how-to/calendar-sync#1-find-your-secret-ics-address)).
+
+```bash
+curl -X PUT "$API_BASE/user/calendar" \
+  -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+  -d '{"ics_url":"https://calendar.google.com/calendar/ical/…/basic.ics"}'
+```
+
+Your meetings appear under **Upcoming** in the Terminal within a sync cycle. Full walkthrough
+(Outlook too, what imports, per-meeting opt-out): [Calendar sync](/how-to/calendar-sync).
+
 ## Next steps
 
 <CardGroup cols={2}>
+  <Card title="Plan and share a meeting" icon="calendar-check" href="/how-to/plan-a-meeting">
+    Prepare a shared knowledge space and invite the people you're meeting.
+  </Card>
   <Card title="Get a report after every meeting" icon="file-lines" href="/how-to/post-meeting-report">
     A routine that writes notes, decisions, and follow-ups when a call ends.
   </Card>

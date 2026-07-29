@@ -4,8 +4,9 @@ opt-in, and — crucially — NEVER write the transcript carrier.
 Post-D7 (P23): meeting-api's collector is the SINGLE writer of ``tc:meeting:{native}`` (segments AND the
 session_end marker). The agent watcher only tails ``transcription_segments`` as a TRIGGER to do agent-domain
 jobs: freeze ONE native routing key per meeting, register the live row, re-arm the copilot while processing
-is enabled, and reap on session_end. It READS the native feed's tail for the copilot resume cursor, but
-writes nothing — `meetings ⊥ agent` (P3). These tests assert that behaviour via keymap/live/dispatch, and
+is enabled (resuming from the worker-advanced cursor — the ONE resume source, ADR 0027), and reap on
+session_end (live row, keymap, AND the desired-state flag). It writes nothing to the carrier —
+`meetings ⊥ agent` (P3). These tests assert that behaviour via keymap/live/dispatch, and
 that no ``tc:meeting:*`` write ever originates here.
 """
 from __future__ import annotations
@@ -23,8 +24,12 @@ class _FakeRedis:
     def get(self, key):
         return self.kv.get(key)
 
-    def set(self, key, value):
+    def set(self, key, value, ex=None):
         self.kv[key] = value
+
+    def expire(self, key, ttl):
+        self.expires = getattr(self, "expires", {})
+        self.expires[key] = ttl
 
     def delete(self, key):
         self.kv.pop(key, None)
@@ -85,8 +90,9 @@ def _native_streams(r):
 # ── multi-meeting separation (resolution + keying) ─────────────────────────────────────────────────
 
 def test_two_distinct_meetings_stay_separate(monkeypatch):
-    """Two numeric ids → two natives → two separate live rows / copilot keys. The collapse the bug
-    produced must NOT happen — and the agent writes NO transcript stream (the collector owns it)."""
+    """Two ROW ids → two separate live rows / copilot keys, keyed on the ROW id (P0 — the native id is
+    NOT unique; keying by it collapsed/leaked). The natives still resolve for DISPLAY. The agent writes
+    NO transcript stream (the collector owns it)."""
     _reset_module_caches()
     monkeypatch.setattr(w, "_resolve_native", lambda mid: {
         "42": ("aaa-aaaa-aaa", "google_meet"),
@@ -98,14 +104,18 @@ def test_two_distinct_meetings_stay_separate(monkeypatch):
     for mid in ("42", "43", "42", "43"):
         w._handle(r, disp, live, "u_live", _payload(mid), *state)
 
-    assert set(live.by_uid) == {"aaa-aaaa-aaa", "bbb-bbbb-bbb"}
-    assert keymap == {"42": "aaa-aaaa-aaa", "43": "bbb-bbbb-bbb"}  # one frozen key per meeting
+    assert set(live.by_uid) == {"42", "43"}                       # live rows keyed by ROW id
+    assert keymap == {"42": "42", "43": "43"}                     # routing key == the row id
+    assert live.by_uid["42"]["native_id"] == "aaa-aaaa-aaa"       # native carried for DISPLAY
+    assert live.by_uid["43"]["native_id"] == "bbb-bbbb-bbb"
     assert _native_streams(r) == []                               # agent wrote NO transcript carrier
 
 
 def test_late_native_resolution_does_not_fork_or_collapse(monkeypatch):
-    """Meeting 43's gateway row lags: None first, native later. The key must NOT flip mid-stream (no fork),
-    43 must never borrow 42's native, and it is keyed only once it resolves."""
+    """Meeting 43's gateway row lags: native None first, resolved later. P0: the carrier keys on the ROW
+    id `mid` from the FIRST segment (always present — no fork, no grace wait, no collapse). 43 never
+    borrows 42's native. The native fills in on the DISPLAY (`native_id`) once the gateway row surfaces;
+    it never changes the routing key."""
     _reset_module_caches()
     state = {"43": None}
 
@@ -115,20 +125,20 @@ def test_late_native_resolution_does_not_fork_or_collapse(monkeypatch):
         return state["43"]
 
     monkeypatch.setattr(w, "_resolve_native", resolve)
-    monkeypatch.setattr(w, "RESOLVE_GRACE_SEC", 1e9)  # never fall back to numeric during the test
 
     r, disp, live = _FakeRedis(), _FakeDispatcher(), _FakeLive()
     _, keymap, _ = st = _fresh_state()
 
     w._handle(r, disp, live, "u", _payload("42"), *st)
-    w._handle(r, disp, live, "u", _payload("43"), *st)   # 43 unresolved, within grace → held
-    assert set(live.by_uid) == {"aaa-aaaa-aaa"}
-    assert "43" not in keymap                             # never numeric-keyed under its native's nose
+    w._handle(r, disp, live, "u", _payload("43"), *st)   # 43's native unresolved — still keyed on the ROW id
+    assert set(live.by_uid) == {"42", "43"}              # BOTH live, each on its own row id
+    assert keymap["43"] == "43"                           # keyed on the row id, never 42's native
+    assert live.by_uid["43"]["native_id"] == "43"        # native pending → display falls back to the row id
 
     state["43"] = ("bbb-bbbb-bbb", "google_meet")
     w._handle(r, disp, live, "u", _payload("43"), *st)
-    assert set(live.by_uid) == {"aaa-aaaa-aaa", "bbb-bbbb-bbb"}
-    assert keymap["43"] == "bbb-bbbb-bbb"
+    assert keymap["43"] == "43"                           # routing key UNCHANGED (no fork)
+    assert live.by_uid["43"]["native_id"] == "bbb-bbbb-bbb"  # display native filled in
 
 
 def test_resolve_native_returns_only_the_matched_id(monkeypatch):
@@ -176,24 +186,58 @@ def test_resolve_native_requests_limit_within_gateway_cap(monkeypatch):
     assert requested <= 100, f"gateway caps limit at 100; requested {requested} → HTTP 422 every call"
 
 
-# ── copilot arming (opt-in) reads the collector-owned feed tail for the resume cursor ───────────────
+# ── copilot arming (opt-in) resumes from the ONE cursor — never the stream tail (ADR 0027) ──────────
 
-def test_arm_reads_native_feed_tail_for_resume_cursor(monkeypatch):
-    """The copilot resumes after the native feed's CURRENT tail. The arm thread READS that tail (the
-    collector writes the feed) and passes it as the dispatch's transcript_start_id — it writes nothing."""
+def test_arm_resumes_from_the_frozen_cursor(monkeypatch):
+    """The arm's transcript_start_id is the worker-advanced cursor (proc:meeting:{row}:cursor) — the
+    SAME resume source the /process toggle reports. Arming from the feed TAIL here used to race the
+    toggle's dispatch, and a tail-armed win silently skipped the backfill (run-46). Writes nothing."""
     _reset_module_caches()
     monkeypatch.setattr(w, "_resolve_native", lambda mid: ("aaa-aaaa-aaa", "google_meet"))
 
     r, disp, live = _FakeRedis(), _FakeDispatcher(), _FakeLive()
-    # The collector has already written 2 entries onto the native feed (simulated here).
-    r.streams["tc:meeting:aaa-aaaa-aaa"] = [{"payload": "c-1"}, {"payload": "c-2"}]
-    r.set("proc:meeting:aaa-aaaa-aaa:on", "1")  # processing is opt-in — enable it so the copilot arms
+    # The collector has already written 2 entries onto the ROW-keyed feed (simulated here).
+    r.streams["tc:meeting:42"] = [{"payload": "c-1"}, {"payload": "c-2"}]
+    r.set("proc:meeting:42:on", "1")        # processing is opt-in — enable it (ROW-keyed)
+    r.set("proc:meeting:42:cursor", "1-0")  # the worker cleaned up to 1-0 before it was reaped
 
     w._handle(r, disp, live, "u_live", _payload("42"), *_fresh_state())
 
     meeting = disp.dispatched[0]["context"]["meeting"]
-    assert meeting["transcript_start_id"] == "2-0"                # tail of the collector-written feed
-    assert len(r.streams["tc:meeting:aaa-aaaa-aaa"]) == 2         # unchanged — the agent appended nothing
+    assert meeting["transcript_start_id"] == "1-0"                # the frozen cursor — gap-fill, no skip
+    assert len(r.streams["tc:meeting:42"]) == 2                   # unchanged — the agent appended nothing
+
+
+def test_arm_refreshes_the_flag_rolling_ttl(monkeypatch):
+    """The flag's REAL end-of-life is its rolling TTL (verified on the eyeball: NO session_end frame
+    crosses the wire on the stop path, so the reap branch is belt-only). While segments flow, each
+    throttled arm refreshes proc:meeting:{row}:on to PROC_FLAG_ROLLING_TTL_SEC; when the flow stops,
+    the flag expires instead of persisting forever."""
+    _reset_module_caches()
+    monkeypatch.setattr(w, "_resolve_native", lambda mid: ("aaa-aaaa-aaa", "google_meet"))
+
+    r, disp, live = _FakeRedis(), _FakeDispatcher(), _FakeLive()
+    r.set("proc:meeting:42:on", "1")
+
+    w._handle(r, disp, live, "u_live", _payload("42"), *_fresh_state())
+
+    assert len(disp.dispatched) == 1
+    assert getattr(r, "expires", {}).get("proc:meeting:42:on") == w.PROC_FLAG_ROLLING_TTL_SEC
+
+
+def test_arm_without_cursor_backfills_full_history(monkeypatch):
+    """A never-processed meeting has no cursor ⇒ the arm starts from 0-0 (full-history backfill), even
+    when the transcript already has entries — the tail is NOT a resume source."""
+    _reset_module_caches()
+    monkeypatch.setattr(w, "_resolve_native", lambda mid: ("aaa-aaaa-aaa", "google_meet"))
+
+    r, disp, live = _FakeRedis(), _FakeDispatcher(), _FakeLive()
+    r.streams["tc:meeting:42"] = [{"payload": "c-1"}, {"payload": "c-2"}]  # history exists
+    r.set("proc:meeting:42:on", "1")
+
+    w._handle(r, disp, live, "u_live", _payload("42"), *_fresh_state())
+
+    assert disp.dispatched[0]["context"]["meeting"]["transcript_start_id"] == "0-0"
 
 
 def test_copilot_processing_is_opt_in(monkeypatch):
@@ -205,32 +249,28 @@ def test_copilot_processing_is_opt_in(monkeypatch):
 
     w._handle(r, disp, live, "u_live", _payload("42"), *_fresh_state())
     assert disp.dispatched == []                    # OFF → no copilot, no processing
-    assert "aaa-aaaa-aaa" in live.by_uid            # …but the meeting still registers
+    assert "42" in live.by_uid                      # …but the meeting still registers (by ROW id)
     assert _native_streams(r) == []                 # …and the agent writes no transcript carrier
 
-    r.set("proc:meeting:aaa-aaaa-aaa:on", "1")         # user enables processing → now it arms
+    r.set("proc:meeting:42:on", "1")                   # user enables processing (ROW-keyed) → now it arms
     w._handle(r, disp, live, "u_live", _payload("42"), *_fresh_state())
     assert len(disp.dispatched) == 1
 
 
-def test_unresolved_meeting_surfaces_under_numeric_after_grace(monkeypatch):
-    """A meeting whose native NEVER resolves is HELD during RESOLVE_GRACE_SEC (not yet keyed), then
-    surfaces under its NUMERIC key — never swallowed."""
+def test_unresolved_native_still_keys_on_row_id_immediately(monkeypatch):
+    """P0: a meeting whose native NEVER resolves is NOT held — the ROW id `mid` keys the carrier from the
+    FIRST segment (always present), so the transcript never leaks/starves. Only the human-readable native
+    (display) is degraded to the row id until/unless the gateway row surfaces."""
     _reset_module_caches()
-    monkeypatch.setattr(w, "_resolve_native", lambda mid: None)   # never resolves
-    clock = [1000.0]
-    monkeypatch.setattr(w.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(w, "RESOLVE_GRACE_SEC", 6.0)
+    monkeypatch.setattr(w, "_resolve_native", lambda mid: None)   # native never resolves
+    monkeypatch.setattr(w.time, "monotonic", lambda: 1000.0)
 
     r, disp, live = _FakeRedis(), _FakeDispatcher(), _FakeLive()
     _, keymap, _ = st = _fresh_state()
 
-    w._handle(r, disp, live, "u", _payload("77"), *st)          # within grace → HELD
-    assert set(live.by_uid) == set() and "77" not in keymap
-
-    clock[0] += 7.0                                              # grace elapses
-    w._handle(r, disp, live, "u", _payload("77"), *st)          # now surfaces under numeric
-    assert "77" in live.by_uid and keymap["77"] == "77"         # not swallowed
+    w._handle(r, disp, live, "u", _payload("77"), *st)          # keyed IMMEDIATELY on the row id
+    assert "77" in live.by_uid and keymap["77"] == "77"         # surfaced under the row id (not swallowed)
+    assert live.by_uid["77"]["native_id"] == "77"              # display falls back to the row id
 
 
 class _WrongTypeRedis(_FakeRedis):
@@ -251,8 +291,8 @@ def test_proc_flag_get_never_hits_the_processed_stream(monkeypatch):
     monkeypatch.setattr(w.time, "monotonic", lambda: 100000.0)   # > REARM_SEC since last_arm(0) → arms
 
     r, disp, live = _WrongTypeRedis(), _FakeDispatcher(), _FakeLive()
-    r.xadd("proc:meeting:nat-77", {"payload": "{}"})            # the processed-notes STREAM exists (collision bait)
-    r.set("proc:meeting:nat-77:on", "1")                        # processing ENABLED via the flag
+    r.xadd("proc:meeting:77", {"payload": "{}"})               # the ROW-keyed processed-notes STREAM (collision bait)
+    r.set("proc:meeting:77:on", "1")                           # processing ENABLED via the ROW-keyed flag
 
     w._handle(r, disp, live, "u", _payload("77"), *_fresh_state())  # must NOT raise WRONGTYPE
     assert len(disp.dispatched) == 1                            # armed off the flag
@@ -270,13 +310,32 @@ def test_session_end_reaps_copilot_without_writing_the_carrier(monkeypatch):
     r, disp, live = _FakeRedis(), _FakeDispatcher(), _FakeLive()
     _, keymap, _ = st = _fresh_state()
 
-    w._handle(r, disp, live, "u", _payload("9"), *st)        # establish the meeting
-    assert "nat-9" in live.by_uid and keymap.get("9") == "nat-9"
+    w._handle(r, disp, live, "u", _payload("9"), *st)        # establish the meeting (keyed by row id 9)
+    assert "9" in live.by_uid and keymap.get("9") == "9"
 
     w._handle(r, disp, live, "u", {"type": "session_end", "meeting_id": "9"}, *st)
-    assert "nat-9" not in live.by_uid                        # live row dropped
+    assert "9" not in live.by_uid                            # live row dropped (by the row-id key)
     assert "9" not in keymap                                 # keymap cleared (clean relaunch)
     assert _native_streams(r) == []                          # the agent wrote NO session_end marker
+
+
+def test_session_end_reaps_the_processing_flag(monkeypatch):
+    """session_end also deletes the desired-state flag (proc:meeting:{row}:on) — the meeting is over, so
+    a leftover flag must not survive to litter redis / re-arm a copilot for a dead meeting (ADR 0027:
+    this watcher is the flag's end-of-life owner). The frozen cursor is intentionally LEFT in place."""
+    _reset_module_caches()
+    monkeypatch.setattr(w, "_resolve_native", lambda mid: ("nat-9", "google_meet"))
+    monkeypatch.delenv("VEXA_BOT_API_KEY", raising=False)
+    r, disp, live = _FakeRedis(), _FakeDispatcher(), _FakeLive()
+    st = _fresh_state()
+    r.set("proc:meeting:9:on", "1")
+    r.set("proc:meeting:9:cursor", "5-0")
+
+    w._handle(r, disp, live, "u", _payload("9"), *st)
+    w._handle(r, disp, live, "u", {"type": "session_end", "meeting_id": "9"}, *st)
+
+    assert r.get("proc:meeting:9:on") is None                # desired state reaped with the meeting
+    assert r.get("proc:meeting:9:cursor") == "5-0"           # cursor frozen (audit / late gap-fill)
 
 
 # ── P18 (ADR 0010) — fail-loud regression gates: the 90-minute incident as a red-then-green test ──────
@@ -337,3 +396,40 @@ def test_native_resolve_recovers_clears_fault(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Resp())
     assert w._resolve_native("1") == ("nba-agyz-gbe", "google_meet")
     assert w.relay_health()["native_resolve"]["ok"] is True
+
+
+def test_arm_carries_numeric_meeting_id_for_durable_proc_doc(monkeypatch):
+    """The watcher knows the meetings-domain ROW id (the segments' numeric meeting_id) — the arm
+    dispatch must carry it (numeric_meeting_id) so the worker keys its processed-notes stream by it
+    (proc:meeting:{row_id}): unique per meeting run ⇒ a re-sent bot on the same native link never
+    mixes/clobbers a previous meeting's processed doc, and the meeting-api db-writer can persist the
+    stream into the meeting row's data JSONB. The live entry carries it too (for /api/meeting/process)."""
+    _reset_module_caches()
+    monkeypatch.setattr(w, "_resolve_native", lambda mid: ("aaa-aaaa-aaa", "google_meet"))
+    r, disp, live = _FakeRedis(), _FakeDispatcher(), _FakeLive()
+    r.set("proc:meeting:42:on", "1")
+
+    w._handle(r, disp, live, "u_live", _payload("42"), *_fresh_state())
+
+    meeting = disp.dispatched[0]["context"]["meeting"]
+    assert meeting["numeric_meeting_id"] == "42"
+    assert meeting["meeting_id"] == "42"                    # P0: routing keys by the ROW id
+    assert meeting["native_id"] == "aaa-aaaa-aaa"          # native carried SEPARATELY for display
+    assert live.by_uid["42"]["numeric_meeting_id"] == "42"
+
+
+def test_arm_omits_numeric_meeting_id_when_key_is_not_numeric(monkeypatch):
+    """A meeting that never resolved past its uid fallback has no row id to key the proc doc by —
+    the hint is omitted (the worker falls back to the native key), never a bogus value."""
+    _reset_module_caches()
+    monkeypatch.setattr(w, "_resolve_native", lambda mid: ("aaa-aaaa-aaa", "google_meet"))
+    r, disp, live = _FakeRedis(), _FakeDispatcher(), _FakeLive()
+    r.set("proc:meeting:sess-uid-fallback:on", "1")   # ROW-keyed flag; here the "row id" is the uid fallback
+
+    payload = {**_payload("sess-uid-fallback"), "meeting_id": "sess-uid-fallback"}
+    w._handle(r, disp, live, "u_live", payload, *_fresh_state())
+
+    meeting = disp.dispatched[0]["context"]["meeting"]
+    assert meeting["meeting_id"] == "sess-uid-fallback"    # keyed on the (non-numeric) uid fallback
+    assert "numeric_meeting_id" not in meeting            # no row id → the durable-proc hint is omitted
+    assert live.by_uid["sess-uid-fallback"]["numeric_meeting_id"] is None

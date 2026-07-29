@@ -12,6 +12,7 @@ import yaml
 
 from llm import run_harness_turn
 from llm.claude_code import ClaudeCodeHarness, build_argv, parse_stream_json
+from llm.ports import harness_subprocess_env
 
 
 def _git(d: Path, *a: str) -> None:
@@ -82,6 +83,32 @@ def test_parse_stream_json_partial_messages_stream_incrementally():
     assert evs[3]["reply"] == "Hello world"
 
 
+def test_parse_stream_json_rewrites_cli_auth_failure():
+    # A credential-less/expired CLI ends the turn with its OWN auth text — an adapter internal
+    # ("/login" doesn't exist for an API consumer). The done frame must carry the platform's
+    # actionable message instead, with the raw CLI text preserved in `detail`.
+    lines = [json.dumps({"type": "result", "subtype": "error", "is_error": True,
+                         "result": "Not logged in · Please run /login", "session_id": "s3"})]
+    (done,) = parse_stream_json(lines)
+    assert done["type"] == "done" and done["ok"] is False
+    assert "Not logged in" not in done["reply"] and "/login" not in done["reply"]
+    for key in ("HOST_CLAUDE_CREDENTIALS", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+                "CLAUDE_CODE_OAUTH_TOKEN", "VEXA_LLM_API_KEY"):
+        assert key in done["reply"]
+    assert "Settings → Models" in done["reply"]
+    assert done["detail"] == "Not logged in · Please run /login"
+
+
+def test_parse_stream_json_keeps_non_auth_failure_verbatim():
+    # Only auth signatures are rewritten — any other failure text passes through untouched.
+    lines = [json.dumps({"type": "result", "subtype": "error", "is_error": True,
+                         "result": "context window exceeded", "session_id": "s4"})]
+    (done,) = parse_stream_json(lines)
+    assert done["ok"] is False
+    assert done["reply"] == "context window exceeded"
+    assert "detail" not in done
+
+
 # ── the argv (the CLI contract) ──────────────────────────────────────────────
 
 def test_build_argv_core_flags_and_session_model():
@@ -91,6 +118,52 @@ def test_build_argv_core_flags_and_session_model():
     assert "--allowedTools" in argv and "Read" in argv
     assert "--resume" in argv and "s1" in argv
     assert "--model" in argv and "m1" in argv
+
+
+# ── the untrusted-subprocess env scrub (data-plane tenancy) ──────────────────
+# The model-driven harness CLI exposes a Bash tool. It must NOT inherit the worker's REDIS_URL (which
+# reaches the SHARED redis — another tenant's tc:meeting:* / unit:*:in) nor the minted per-dispatch
+# bearer token. Filesystem tenancy is mount-enforced; the data plane is enforced HERE, at the launch env.
+
+def test_harness_subprocess_env_strips_data_plane_secrets(monkeypatch):
+    monkeypatch.setenv("REDIS_URL", "redis://the-shared-bus:6379/0")
+    monkeypatch.setenv("VEXA_AGENT_IDENTITY_TOKEN", "minted.bearer.jwt")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-model-cred")   # the subprocess DOES need its model cred
+    monkeypatch.setenv("GIT_DIR", "/hook/.git")                # git-discovery scrub still composes
+    monkeypatch.setenv("PATH", "/usr/bin")
+    env = harness_subprocess_env()
+    assert "REDIS_URL" not in env, "REDIS_URL must not reach the model's Bash (cross-tenant redis reach)"
+    assert "VEXA_AGENT_IDENTITY_TOKEN" not in env, "the per-dispatch bearer token must not leak in"
+    assert "GIT_DIR" not in env, "the git repo-discovery scrub still composes"
+    assert env["ANTHROPIC_API_KEY"] == "sk-model-cred", "model credentials must survive"
+    assert env["PATH"] == "/usr/bin", "benign vars pass through untouched"
+
+
+def test_exec_subprocess_launches_with_scrubbed_env(monkeypatch):
+    """The DEFAULT runner (real launch path) must pass the scrubbed env to the actual subprocess —
+    negative control: before the fix REDIS_URL/token WOULD ride ``scrubbed_git_env`` into the child."""
+    from llm import claude_code
+
+    monkeypatch.setenv("REDIS_URL", "redis://the-shared-bus:6379/0")
+    monkeypatch.setenv("VEXA_AGENT_IDENTITY_TOKEN", "minted.bearer.jwt")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-model-cred")
+    captured: dict = {}
+
+    class _FakeProc:
+        stdout = iter(())
+
+        def wait(self):
+            return 0
+
+    def _fake_popen(argv, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return _FakeProc()
+
+    monkeypatch.setattr(claude_code.subprocess, "Popen", _fake_popen)
+    list(claude_code._exec_subprocess(["claude", "-p", "hi"], "/tmp"))
+    assert "REDIS_URL" not in captured["env"]
+    assert "VEXA_AGENT_IDENTITY_TOKEN" not in captured["env"]
+    assert captured["env"]["ANTHROPIC_API_KEY"] == "sk-model-cred"  # model cred still delivered
 
 
 # ── run_harness_turn: conformant + free-zone writes both commit ──────────────
@@ -143,6 +216,72 @@ def test_run_harness_turn_propose_only_touches_no_git(tmp_path: Path):
 
     evs = list(run_harness_turn(repo, "look", ClaudeCodeHarness(exec_fn=fake_exec), commit=False))
     assert [e["type"] for e in evs] == ["done"]  # no commit event on the propose-only path
+
+
+# ── per-mount commit + attribution (WP-A1.2 / D4) ────────────────────────────
+
+def _author_of(repo: Path) -> tuple[str, str, str, str]:
+    """(author name, author email, committer name, committer email) of HEAD."""
+    fmt = "%an%n%ae%n%cn%n%ce"
+    out = subprocess.run(["git", "log", "-1", f"--pretty=format:{fmt}"], cwd=str(repo),
+                         capture_output=True, text=True).stdout.splitlines()
+    return tuple(out)  # type: ignore[return-value]
+
+
+def test_run_harness_turn_commits_each_changed_mount_independently(tmp_path: Path):
+    """The active mount set → ONE commit per changed mount (WP-A1.2). The primary and an extra mount
+    are separate repos: a turn that writes both yields TWO commit events, one landing in each repo."""
+    private = tmp_path / "private"; private.mkdir(); _init_repo(private)
+    shared = tmp_path / "shared"; shared.mkdir(); _init_repo(shared)
+
+    def fake_exec(argv, cwd):  # the "model" writes into BOTH mounts
+        (Path(cwd) / "note.md").write_text("private note")
+        (shared / "doc.md").write_text("shared doc")
+        yield json.dumps({"type": "result", "subtype": "success", "result": "wrote both", "session_id": "s1"})
+
+    evs = list(run_harness_turn(private, "write both", ClaudeCodeHarness(exec_fn=fake_exec),
+                                extra_mounts=[shared]))
+    commits = [e for e in evs if e["type"] == "commit"]
+    assert len(commits) == 2, "one commit per changed mount"
+    # each mount got its OWN commit (distinct repos, distinct HEADs)
+    assert (private / "note.md").exists() and (shared / "doc.md").exists()
+    assert "wrote both" in subprocess.run(["git", "log", "--oneline"], cwd=str(private), capture_output=True, text=True).stdout
+    assert "wrote both" in subprocess.run(["git", "log", "--oneline"], cwd=str(shared), capture_output=True, text=True).stdout
+
+
+def test_run_harness_turn_only_commits_the_mount_that_changed(tmp_path: Path):
+    """An extra mount with NO writes must not get an empty commit — only the changed mount commits."""
+    private = tmp_path / "private"; private.mkdir(); _init_repo(private)
+    shared = tmp_path / "shared"; shared.mkdir(); _init_repo(shared)
+    shared_head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(shared), capture_output=True, text=True).stdout.strip()
+
+    def fake_exec(argv, cwd):  # writes ONLY the private mount
+        (Path(cwd) / "note.md").write_text("only private")
+        yield json.dumps({"type": "result", "subtype": "success", "result": "one", "session_id": "s1"})
+
+    evs = list(run_harness_turn(private, "write private", ClaudeCodeHarness(exec_fn=fake_exec),
+                                extra_mounts=[shared]))
+    assert len([e for e in evs if e["type"] == "commit"]) == 1
+    # shared HEAD is unmoved (no empty commit)
+    assert subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(shared), capture_output=True, text=True).stdout.strip() == shared_head
+
+
+def test_run_harness_turn_attributes_commit_to_the_principal(tmp_path: Path):
+    """Attribution (D4): author = the dispatch principal, committer = the platform — on EACH mount."""
+    private = tmp_path / "private"; private.mkdir(); _init_repo(private)
+    shared = tmp_path / "shared"; shared.mkdir(); _init_repo(shared)
+
+    def fake_exec(argv, cwd):
+        (Path(cwd) / "n.md").write_text("p")
+        (shared / "d.md").write_text("s")
+        yield json.dumps({"type": "result", "subtype": "success", "result": "x", "session_id": "s1"})
+
+    list(run_harness_turn(private, "write", ClaudeCodeHarness(exec_fn=fake_exec),
+                          author=("Jane Doe", "jane@example.com"), extra_mounts=[shared]))
+    for repo in (private, shared):
+        an, ae, cn, ce = _author_of(repo)
+        assert (an, ae) == ("Jane Doe", "jane@example.com"), "author = principal"
+        assert (cn, ce) == ("Vexa", "platform@vexa.ai"), "committer = platform"
 
 
 # ── transcript-size accounting (resume-cost cap) ─────────────────────────────

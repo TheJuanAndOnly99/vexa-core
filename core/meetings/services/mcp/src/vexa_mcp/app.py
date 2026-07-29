@@ -3,7 +3,9 @@
 Port of 0.10.6 ``services/mcp/main.py`` reduced to the tools whose REST routes EXIST on
 the v0.12 public API (the gateway — ``core/gateway/services/gateway/src/gateway/app.py``).
 Every tool is a thin FastAPI route; ``FastApiMCP`` derives the MCP tool surface from them
-and mounts the streamable-HTTP MCP transport at ``/mcp``.
+and mounts the streamable-HTTP MCP transport at ``/mcp``. The mount uses an ASGI
+passthrough so a sessioned ``GET /mcp`` can start its SSE response immediately
+(#921) — fastapi-mcp's buffered adapter never completes for an open EventSource.
 
 Auth: the caller's credential (``Authorization: Bearer <key>`` / raw ``Authorization`` /
 ``X-API-Key``) is treated as the Vexa API key and forwarded to the gateway as ``X-API-Key``
@@ -27,6 +29,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from .link_parser import ParseMeetingLinkResponse, parse_meeting_url
 from .prompts import PROMPTS, get_prompt_result
+from .streamable_http import install_streaming_http_transport
 
 _DEFAULT_GATEWAY_URL = "http://gateway:8000"
 
@@ -82,18 +85,21 @@ class RequestMeetingBot(BaseModel):
             "The meeting identifier.\n"
             "- Google Meet: meeting code like 'abc-defg-hij'\n"
             "- Microsoft Teams: numeric meeting ID only (10-15 digits) from teams.live.com/meet/<id>\n"
-            "- Zoom: numeric meeting ID only (10-11 digits)"
+            "- Zoom: numeric meeting ID only (10-11 digits)\n"
+            "- Jitsi: ALWAYS pass meeting_url (the full room URL) — a jitsi room is deployment-scoped,\n"
+            "  so a bare room name is rejected (422); the id is derived from the URL"
         ),
     )
     language: Optional[str] = Field(None, description="Optional language code for transcription (e.g., 'en', 'es'). If not specified, auto-detected")
     bot_name: Optional[str] = Field(None, description="Optional custom name for the bot in the meeting")
-    platform: str = Field("google_meet", description="The meeting platform (e.g., 'google_meet', 'teams', 'zoom'). Default is 'google_meet'.")
+    platform: str = Field("google_meet", description="The meeting platform (e.g., 'google_meet', 'teams', 'zoom', 'jitsi'). Default is 'google_meet'.")
     passcode: Optional[str] = Field(
         None,
         description=(
             "Meeting passcode.\n"
             "- Teams: passcode is the value of the `?p=` parameter in your Teams meeting link.\n"
-            "- Zoom: passcode is the value of the `?pwd=` parameter (optional)."
+            "- Zoom: passcode is the value of the `?pwd=` parameter (optional).\n"
+            "- Jitsi: the room password, when the room is protected (optional)."
         ),
     )
 
@@ -336,5 +342,8 @@ def create_app(
         return get_prompt_result(name, arguments)
 
     mcp.mount_http()
+    # fastapi-mcp 0.4 buffers the ASGI response; a sessioned GET is an open SSE
+    # stream and never completes that buffer — install a passthrough (#921).
+    install_streaming_http_transport(mcp)
     app.state.mcp = mcp
     return app

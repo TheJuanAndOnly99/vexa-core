@@ -1,18 +1,27 @@
 ---
 title: "Deployment"
-description: "Self-host Vexum with Docker Compose — air-gapped, with bring-your-own inference."
+description: "Self-host Vexa with Docker Compose — air-gapped, with bring-your-own inference."
 ---
 
-Vexum runs **in your own environment** — open-source, self-hostable, air-gappable. Data, recordings, and
+Vexa runs **in your own environment** — open-source, self-hostable, air-gappable. Data, recordings, and
 agent state stay on infrastructure you control.
 
 ## Quick start (Docker Compose)
 
-Prerequisites: a Linux host (Ubuntu 24.04), Docker, `git`, `curl`.
+Prerequisites: a Linux host (Ubuntu 24.04) for production, **Docker engine ≥ v26** (agent workers
+mount each granted workspace as an isolated volume subpath — older engines fail worker creation;
+`make all` checks and refuses), `git`, `curl`. A Mac with Docker Desktop works for a local
+evaluation — everything runs in containers either way. Published `vexaai/v012-*` images include
+`linux/arm64` variants alongside `linux/amd64`, so Docker on Apple Silicon pulls arm64 where
+available — but the arm64 images are published **best-effort**: release CI currently validates
+only the amd64 images (no arm64 execution leg yet), so treat Apple Silicon as experimental.
+`vexaai/vexa-bot` remains amd64-only (the install pulls the published image; `make bot` builds a local `vexa/vexa-bot:dev` for development). For GPU transcription on
+Mac, point `TRANSCRIPTION_SERVICE_URL` at any OpenAI-compatible local endpoint
+(see [Configuration](/configuration)).
 
 ```bash
 curl -fsSL https://get.docker.com | sh
-git clone https://github.com/Vexa-ai/vexa-core.git && cd vexa-core
+git clone https://github.com/Vexa-ai/vexa.git && cd vexa
 
 make all      # full stack via Docker Compose — each service in its own container
 make bot      # build the meeting bot FROM SOURCE — required before a bot can join a meeting
@@ -47,8 +56,10 @@ absent).
 
 ## Configuration
 
-- **Transcription (STT)** — `TRANSCRIPTION_SERVICE_URL` / `TRANSCRIPTION_SERVICE_TOKEN`. Unset → bots
-  join and capture, but produce no transcript.
+- **Transcription (STT)** — `TRANSCRIPTION_SERVICE_URL` / `TRANSCRIPTION_SERVICE_TOKEN`. Unset →
+  default `POST /bots` answers **503** (refuse loud). Capture-only: set `TRANSCRIBE_ENABLED=false`
+  or pass `{"transcribe_enabled": false}` on the spawn. See
+  [Configuration](/configuration#transcription-stt).
 - **Object storage** — MinIO (`MINIO_*`): meeting recordings and agent workspaces live in your bucket.
   The default `MINIO_HOST_PORT=9000` is a common port — if it's already taken on your host
   (`make all` fails with `bind … 127.0.0.1:9000 … address already in use`), set a free port in `.env`.
@@ -60,9 +71,11 @@ absent).
 
 Speech-to-text is the one **GPU workload**, so it is **carved out** of the main stack: `make all`
 runs GPU-free and anywhere, and the STT service is its own deploy unit at
-[`deploy/transcription`](https://github.com/Vexa-ai/vexa-core/tree/main/deploy/transcription)
-([`core/meetings/services/transcription`](https://github.com/Vexa-ai/vexa-core/tree/main/core/meetings/services/transcription)
+[`deploy/transcription`](https://github.com/Vexa-ai/vexa/tree/main/deploy/transcription)
+([`core/meetings/services/transcription`](https://github.com/Vexa-ai/vexa/tree/main/core/meetings/services/transcription)
 is the brick — faster-whisper / CTranslate2 behind an OpenAI-compatible `/v1/audio/transcriptions`).
+Language is detected per transcription window and stamped on each segment; force a single language
+via the bot request's `language` (see [Send a bot](/how-to/send-a-bot)).
 
 Stand it up wherever a GPU lives (the same host or a dedicated GPU box):
 
@@ -81,6 +94,14 @@ Then point the main stack at it in `deploy/compose/.env`:
 TRANSCRIPTION_SERVICE_URL=http://<gpu-host>:8083   # base URL; client appends /v1/audio/transcriptions
 TRANSCRIPTION_SERVICE_TOKEN=<same as the unit's API_TOKEN>
 ```
+
+**Which model id goes where:** the stack sends `TRANSCRIPTION_MODEL` as the OpenAI-compatible
+`model` field on every request (unset → `whisper-1`). The **bundled unit ignores it** — pick its
+model with the unit's own `MODEL_SIZE`. Backends that **validate** the field need the right id:
+**Groq** → `whisper-large-v3-turbo`, **OpenAI** → `whisper-1` / `gpt-4o-transcribe`,
+**vLLM/LiteLLM** → the exact served model name. Any OpenAI-compatible
+`/v1/audio/transcriptions` endpoint works: set `TRANSCRIPTION_SERVICE_URL` to its base URL,
+`TRANSCRIPTION_SERVICE_TOKEN` to its key, and `TRANSCRIPTION_MODEL` to the id it expects.
 
 Now bots transcribe end-to-end: **bot → transcription service → segments → meeting-api `collector`
 → live fan-out**. Scale by adding workers (one GPU each) in the unit's `docker-compose.yml` +
@@ -119,6 +140,20 @@ server {
     }
 }
 ```
+
+If you publish the **gateway** (`:18056`) through a reverse proxy and turn on the edge guard
+(`GUARD_ENABLED=true`), set `GUARD_TRUSTED_PROXIES` to the proxy's IP and have the proxy forward the
+real client IP:
+
+```nginx
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+```
+
+Without it, every request keys to the proxy IP — one global rate-limit/ban bucket shared by all
+clients, so one abuser throttles everyone. The gateway honors the `X-Forwarded-For` chain only from an
+IP named in `GUARD_TRUSTED_PROXIES` (it reads the rightmost entry); a spoofed header from any other
+source is ignored, so it cannot rotate an abuser's budget. See
+[Configuration → Gateway edge protection](/configuration#gateway-edge-protection).
 
 The terminal carries its own Google/Microsoft OAuth login, so the proxy needs no auth of its own.
 

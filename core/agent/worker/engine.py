@@ -22,6 +22,7 @@ import itertools
 import json
 import logging
 import os
+import shutil
 from pathlib import Path
 from typing import Callable, Iterator, Protocol
 
@@ -61,11 +62,152 @@ _FALLBACK_MEMORY_MD = (
 TurnFn = Callable[[str], Iterator[dict]]
 
 
+# ── the active mount set (WP-A1.1) — declared VERBATIM to the model so it never guesses where to write ──
+
+def active_mounts() -> list[dict]:
+    """The dispatch's ordered active mount set from ``VEXA_MOUNTS`` (``[{slug,path,role,write,primary}]``).
+    A dispatch that predates the set (no ``VEXA_MOUNTS``) falls back to the single private baseline at
+    ``VEXA_WORKSPACE_PATH`` — identical to today's one-workspace behavior."""
+    raw = os.environ.get("VEXA_MOUNTS")
+    if raw:
+        try:
+            data = json.loads(raw)
+            mounts = [m for m in data if isinstance(m, dict) and m.get("path")] if isinstance(data, list) else []
+            if mounts:
+                return mounts
+        except (ValueError, TypeError):
+            log.warning("VEXA_MOUNTS is not valid JSON — falling back to the private baseline")
+    path = os.environ.get("VEXA_WORKSPACE_PATH", "/workspace")
+    return [{"slug": Path(path).name, "path": path, "role": "private", "write": True, "primary": True}]
+
+
+def _tier_label(m: dict) -> str:
+    """The mount's TIER + write-rule, declared VERBATIM so the model never guesses where it may write
+    (AMENDMENT 4 three-tier stack). Derived from role/primary/write, not from the slug."""
+    role = m.get("role", "private")
+    if role == "global":
+        return "GLOBAL SYSTEM tier — READ-ONLY (platform behaviour/skills/tools; never write here)"
+    if role == "system":
+        return ("PRIVATE SYSTEM tier — read-write (who you're helping via `identity.md`, your"
+                " chats/sessions, settings, routines; private, never shared)")
+    if m.get("primary"):
+        return "your PRIVATE baseline (durable personal memory) — read-write"
+    writable = "read-write" if m.get("write", True) else "READ-ONLY (do not write here)"
+    return f"{role} workspace — {writable}"
+
+
+def _continuity_root(work: Path) -> Path:
+    """Where chat continuity (session pointers + transcripts) LIVES: the PRIVATE SYSTEM mount
+    (``_system``) when the dispatch declares one, else the turn's workspace. The flat model can
+    point the turn's cwd at a SHARED workspace (Personal off -> first active mount), and chat
+    conversations are private to the subject — anchoring them to the cwd both LEAKS them onto the
+    shared volume and strands them where ``workspace_reader.history`` (which reads the subject's
+    own tree) can't see them: the "chats list but don't load" bug."""
+    for m in active_mounts():
+        if m.get("role") == "system" and m.get("path"):
+            return Path(m["path"])
+    return work
+
+
+def _adopt_legacy_continuity(chat_root: Path, work: Path, session: str) -> None:
+    """MIGRATE-ON-READ for the continuity-carrier move (ADR-0028's write-side twin): threads recorded
+    BEFORE chats anchored to ``_system`` live under the turn's then-cwd. When the anchored pointer is
+    absent, adopt the thread — pointer AND transcript — from the first mount dir that has it, so
+    moving the carrier never forks a conversation ("this is the first message I'm seeing" on turn 2).
+    Same adoption discipline ``_session_file`` already applies to the legacy single-thread file."""
+    target = chat_root / ".claude" / "sessions" / f"{session}.session"
+    if target.exists():
+        return
+    candidates = [work] + [Path(m["path"]) for m in active_mounts() if m.get("path")]
+    for root in candidates:
+        if root == chat_root:
+            continue
+        src = root / ".claude" / "sessions" / f"{session}.session"
+        try:
+            if not src.exists():
+                continue
+            sid = src.read_text().strip()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(sid + "\n" if sid else "")
+            # the transcript must move WITH the pointer — a resumed sid whose jsonl is missing under
+            # the new projects link is an alien id (the stale-resume retry silently starts fresh)
+            if sid:
+                for t in (root / ".claude" / "projects").glob(f"*/{sid}.jsonl"):
+                    dst = chat_root / ".claude" / "projects" / t.parent.name / t.name
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    if not dst.exists():
+                        shutil.copyfile(t, dst)
+            return
+        except OSError:
+            continue
+
+
+def kg_links_preamble() -> str:
+    """Entity references must be ACTIONABLE in the client. Chat replies and workspace docs render
+    ``[[Title]]`` as a clickable entity chip and workspace file paths as links (the terminal resolves
+    both across every mounted workspace — clients/terminal/src/ui-kit/docLinks.tsx). A plain-text
+    mention of a known entity is a dead end, so this rule ships on EVERY turn, not just multi-mount
+    ones — old workspaces whose seeded CLAUDE.md predates it get the behaviour too."""
+    return (
+        "## Referencing knowledge (always)\n\n"
+        "Your replies render in a client that turns entity references into clickable chips:\n"
+        "- Whenever you mention a person, company, organization, project, meeting, or task that has"
+        " (or that you are creating) an entity doc under `kg/entities/`, write it as `[[Title]]` —"
+        " in chat replies AND in workspace docs alike. Never mention a known entity as plain text.\n"
+        "- Reference other workspace files by their path in backticks (e.g. `kg/dashboards/plan.md`)"
+        " or a markdown link — both are clickable.\n"
+        "- Don't write `[[wikilinks]]` for things that have no entity doc (they render as inert"
+        " 'not found' chips) — create the entity first, or use plain text.\n\n"
+    )
+
+
+def mounts_preamble(mounts: list[dict]) -> str:
+    """A prompt preamble that DECLARES every mount in the THREE-TIER stack to the model VERBATIM — names,
+    paths, tiers, roles, write rules — plus the default write-routing policy (WP-A1.2). The agent must
+    never guess where it may read/write. Enforcement is minimal in this WP (per-mount commit with the
+    principal as author); the routing rule is STATED. A single private mount ⇒ no preamble (nothing to
+    disambiguate — the legacy one-workspace turn is unchanged)."""
+    if len(mounts) <= 1:
+        return ""
+    lines = ["## Your mounted workspaces", "",
+             "This turn mounts a STACK of workspaces (the three-tier mount stack). Each is a separate git"
+             " repo; every writable one is committed independently after the turn:",
+             ""]
+    for m in mounts:
+        lines.append(f"- `{m['path']}` — **{m.get('slug')}** ({_tier_label(m)})")
+        # A per-workspace PURPOSE (stored in the workspace, travels when shared) tells the agent what THIS
+        # workspace is for — so a composition (Personal + a deal ws + a dept ws) self-explains where to write.
+        purpose = (m.get("purpose") or "").strip()
+        if purpose:
+            lines.append(f"    - Purpose: {purpose}")
+    lines += [
+        "",
+        "Write-routing policy:",
+        "- Platform behaviour/skills/tools live in the GLOBAL SYSTEM tier (`_global`) — READ-ONLY, never write it.",
+        "- Chats/sessions/settings, and who you're helping (`identity.md`) → the PRIVATE SYSTEM tier (`_system`).",
+        "- If `_system/identity.md` still has no user name, ASK the user their name early and record it there"
+        " (the full profile — company, role, relationships — belongs in the Personal baseline's `self: true`"
+        " person entity, not here).",
+        "- Personal notes/drafts and anything the user marks private → your PRIVATE baseline mount.",
+        "- Content produced FOR a shared/community space (shared notes, common docs, shared entities) →"
+        " the matching shared mount (only if it is read-write).",
+        "- When a workspace states a Purpose (above), let it decide where content belongs — write material"
+        " that matches a workspace's purpose into THAT workspace.",
+        "- Never write to a READ-ONLY mount.",
+        "Always use ABSOLUTE paths under the mount you intend — do not guess or invent mount paths.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 class _Stream(Protocol):
     """The slice of redis the harness needs (XADD out, XREAD in) — a fake satisfies it in tests."""
 
     def xadd(self, name: str, fields: dict) -> str: ...
     def xread(self, streams: dict, count: int = 1, block: int | None = None) -> list: ...
+    # xrevrange is OPTIONAL (serve() falls back to "$" when the stream object lacks it — older fakes):
+    # it anchors the in-topic read at the boot-time tail so a message XADDed while the entrypoint turn
+    # runs is consumed after it instead of lost ("$" only sees entries added after the first xread).
 
 
 # ── the agent turn over the mounted workspace (drives the llm HarnessPort) ────────────────────────
@@ -129,13 +271,37 @@ def _resume_id(work: Path, sess_file: Path, harness: HarnessPort) -> str | None:
     return sid or None
 
 
+def _principal_author() -> tuple[str, str] | None:
+    """The dispatch PRINCIPAL (name, email) for commit attribution (D4) — the authenticated human whose
+    input drove the turn, stamped into the worker env by the dispatcher. Absent ⇒ None (git falls back to
+    its configured identity, and the committer is still the platform via ``_commit_env``)."""
+    name = (os.environ.get("VEXA_PRINCIPAL_NAME") or "").strip()
+    email = (os.environ.get("VEXA_PRINCIPAL_EMAIL") or "").strip()
+    if name and email:
+        return name, email
+    return None
+
+
+def _extra_mount_paths(work: Path) -> list[Path]:
+    """The WRITABLE mounts OTHER than the primary ``work`` — the additional repos a turn may have written,
+    each committed independently after the turn (WP-A1.2). READ-ONLY mounts (the ``_global`` GLOBAL SYSTEM
+    tier) are EXCLUDED — agents never write, and thus never commit, ``_global`` (AMENDMENT 4)."""
+    extras: list[Path] = []
+    for m in active_mounts():
+        p = Path(m["path"])
+        if not m.get("primary") and m.get("write", True) and p != work:
+            extras.append(p)
+    return extras
+
+
 def run_turn_over_workspace(
     work: Path, prompt: str, *, model: str | None = None, allowed_tools: list[str] | None = None,
     commit: bool = True, session_continuity: bool = True, session: str = DEFAULT_CHAT_SESSION,
 ) -> Iterator[dict]:
-    """One governed agent turn over the mounted workspace: resume from the session file, drive
-    ``run_harness_turn`` (which commits the tree when it changed), and persist the captured session
-    id. A stale resume (the harness session expired) retries fresh once.
+    """One governed agent turn over the mounted workspace SET: resume from the session file, DECLARE the
+    active mounts to the model, drive ``run_harness_turn`` (which commits EACH changed mount, authored by
+    the dispatch principal), and persist the captured session id. A stale resume (the harness session
+    expired) retries fresh once.
     ``allowed_tools`` defaults to Read/Write/Edit; pass ``["Read"]`` for a propose-only (no-write) turn.
     ``session`` namespaces the continuity file so chat threads stay distinct (default ``"main"``)."""
     _ensure_repo(work)
@@ -144,18 +310,30 @@ def run_turn_over_workspace(
     import worker.worker as _w
     factory = getattr(_w, "harness_factory", harness_from_env)
     harness: HarnessPort = factory()
-    harness.prepare(work)  # harness-specific continuity/skills wiring (durable, workspace-rooted)
-    sess_file = _session_file(work, session)
+    chat_root = _continuity_root(work)  # chats are PRIVATE: _system when mounted, never a shared cwd
+    harness.prepare(work, chat_root=chat_root)  # harness-specific continuity/skills wiring (durable)
+    if session and session_continuity:
+        _adopt_legacy_continuity(chat_root, work, session)  # migrate-on-read: pre-anchoring threads
+    sess_file = _session_file(chat_root, session)
     # session_continuity=False (the meeting copilot): never read/write the shared chat session — its
     # card-extraction beats must NOT pollute the user's chat conversation memory.
-    resume = _resume_id(work, sess_file, harness) if session_continuity else None
+    resume = _resume_id(chat_root, sess_file, harness) if session_continuity else None
     allowed = allowed_tools or ["Read", "Write", "Edit"]
-    gen = run_harness_turn(work, prompt, harness, allowed_tools=allowed, session=resume, model=model, commit=commit)
+    # Declare the mount set to the model VERBATIM (WP-A1.1) + the write-routing policy (WP-A1.2), so the
+    # agent never guesses where it may read/write. Single-mount turns get no mounts preamble; the
+    # kg-links rule ([[wikilinks]] render as actionable entity chips) applies to EVERY turn.
+    mounts = active_mounts()
+    author = _principal_author()
+    extras = _extra_mount_paths(work)
+    turn_prompt = kg_links_preamble() + mounts_preamble(mounts) + prompt
+    gen = run_harness_turn(work, turn_prompt, harness, allowed_tools=allowed, session=resume, model=model,
+                           commit=commit, author=author, extra_mounts=extras)
     first = next(gen, None)
     if resume and first is not None and first.get("type") == "done" and not first.get("ok", True):
         if sess_file.exists():
             sess_file.unlink()
-        gen = run_harness_turn(work, prompt, harness, allowed_tools=allowed, session=None, model=model, commit=commit)
+        gen = run_harness_turn(work, turn_prompt, harness, allowed_tools=allowed, session=None, model=model,
+                               commit=commit, author=author, extra_mounts=extras)
         first = next(gen, None)
     captured: str | None = None
     for ev in (gen if first is None else itertools.chain([first], gen)):
@@ -185,17 +363,42 @@ def serve(stream: _Stream, *, out_topic: str, in_topic: str, turn: TurnFn, start
     Each turn's UnitEvents are XADD'd to ``out_topic`` (tagged with a turn id), followed by a
     ``turn-complete`` marker. An empty blocking read (idle) returns — the process exits and the
     container is reaped (TTL-on-idle). A ``{"type":"stop"}`` message exits immediately.
+
+    Every turn opens with a ``turn-accepted`` event — the worker's LIVENESS ACK. It flips the UI
+    off "Starting agent" the moment the turn is picked up (long before the first model token) and
+    is the evidence the dispatcher's warm-delivery watchdog waits on: no accepted event = the
+    message was NOT taken (worker exited in the race window) → the dispatcher respawns. A warm
+    in-topic message carries a ``nonce`` the ack echoes so the watchdog can match ITS delivery.
     """
-    def run_message(prompt: str, turn_id: str) -> None:
+    def run_message(prompt: str, turn_id: str, nonce: str | None = None) -> None:
+        ack: dict = {"type": "turn-accepted", "turn_id": turn_id}
+        if nonce:
+            ack["nonce"] = nonce
+        stream.xadd(out_topic, {"event": json.dumps(ack)})
         for ev in turn(prompt):
             stream.xadd(out_topic, {"event": json.dumps({**ev, "turn_id": turn_id})})
         stream.xadd(out_topic, {"event": json.dumps({"type": "turn-complete", "turn_id": turn_id})})
+
+    # Anchor the in-topic cursor at the BOOT-TIME tail, before the entrypoint turn runs. The
+    # dispatcher pre-delivers each chat message to the in topic BEFORE asking the runtime to spawn
+    # (warm delivery): on a COLD spawn that same prompt arrives as the entrypoint, so everything
+    # already in the stream at boot must be SKIPPED (no double turn) — while a message that lands
+    # DURING the entrypoint turn (previously invisible to a "$" read, a lost turn) is consumed
+    # right after it. Streams without history anchor at 0-0; a stream object without xrevrange
+    # (older test fakes) keeps the legacy "$" behavior.
+    last = "$"
+    xrevrange = getattr(stream, "xrevrange", None)
+    if xrevrange is not None:
+        try:
+            tail = xrevrange(in_topic, count=1)
+            last = tail[0][0] if tail else "0-0"
+        except Exception:  # noqa: BLE001 — tail anchoring is an upgrade, never a boot blocker
+            last = "$"
 
     first = start_prompt(start)
     if first:
         run_message(first, "t0")
 
-    last = "$"
     n = 0
     while True:
         resp = stream.xread({in_topic: last}, count=1, block=idle_ms)
@@ -208,7 +411,7 @@ def serve(stream: _Stream, *, out_topic: str, in_topic: str, turn: TurnFn, start
                 if msg.get("type") == "stop":
                     return
                 n += 1
-                run_message(msg.get("prompt", ""), f"t{n}")
+                run_message(msg.get("prompt", ""), f"t{n}", nonce=msg.get("nonce"))
 
 
 def main() -> None:  # pragma: no cover — the container entrypoint (wired in tests via serve())
@@ -241,8 +444,15 @@ def main() -> None:  # pragma: no cover — the container entrypoint (wired in t
         # The GOVERNED, workspace-driven copilot config (agents/meeting.md) — loaded ONCE at meeting
         # start from the mounted workspace; absent ⇒ all defaults. Env stays the ultimate model default.
         cfg = load_meeting_config(work)
-        # native id == the tail of the transcript stream (tc:meeting:<native>); meeting facts are in env.
-        native = os.environ.get("VEXA_MEETING_ID") or transcript_stream.rsplit(":", 1)[-1]
+        # P0 (cross-tenant leak fix): the transcript carrier is keyed by the meetings-domain ROW id
+        # (VEXA_MEETING_NUMERIC_ID) — the transcript_stream tail is now that row id, NOT the native id.
+        # The NATIVE id (human-readable, e.g. abc-defg-hij) is carried SEPARATELY in VEXA_MEETING_ID for
+        # display + the readable kg doc name (nuance #1: kg/entities/meeting/{native}.md must survive).
+        # Never derive `native` from the stream tail anymore (that is the row id); fall back to the tail
+        # only when VEXA_MEETING_ID is somehow unset (older dispatcher), which at worst degrades the
+        # display name, never the row-scoped isolation.
+        row_id = os.environ.get("VEXA_MEETING_NUMERIC_ID") or transcript_stream.rsplit(":", 1)[-1]
+        native = os.environ.get("VEXA_MEETING_ID") or row_id
         session_uid = os.environ.get("VEXA_MEETING_SESSION_UID") or native
         platform = os.environ.get("VEXA_MEETING_PLATFORM") or "google_meet"
         import datetime as _dt
@@ -282,10 +492,26 @@ def main() -> None:  # pragma: no cover — the container entrypoint (wired in t
             idle_ms=idle_ms, beat_segments=cfg.cadence_segments,
             doc_turn=doc_turn, enabled=cfg.enabled,
             start_id=os.environ.get("VEXA_TRANSCRIPT_START_ID", "0"),
-            proc_stream=f"proc:meeting:{native}",
-            cursor_key=f"proc:meeting:{native}:cursor",
+            # P0 (cross-tenant leak fix): BOTH the processed-notes stream AND its cursor key on the
+            # meetings-domain ROW id (VEXA_MEETING_NUMERIC_ID) — unique per meeting run, so neither a
+            # re-sent bot on the same native link NOR a different tenant on the same link can ever
+            # mix/clobber/read another meeting's processed doc. The meeting-api db-writer (which knows
+            # its own row ids) drains proc:meeting:{row_id} into that meeting row's data JSONB (durable).
+            # The cursor is now a position in the ROW-KEYED transcript stream tc:meeting:{row_id} (each
+            # row has its own stream), so it too MUST be row-scoped — a shared native-keyed cursor would
+            # resume one row from another row's position (and leak progress across tenants).
+            proc_stream=f"proc:meeting:{row_id}",
+            cursor_key=f"proc:meeting:{row_id}:cursor",
             on_proc_note=on_proc_note,
             on_envelope=on_envelope,
+            # Provenance stamped on every processed-notes entry: what pipeline/provider/model
+            # produced this cleaned view — persisted verbatim into the durable view's `params`
+            # (meeting.data processed views) by the meeting-api db-writer (reproducibility).
+            proc_params={
+                "pipeline": "meeting-copilot/proc-notes", "version": 1,
+                "provider": os.environ.get("VEXA_LLM_PROVIDER"),
+                "model": cfg.model or os.environ.get("VEXA_LLM_MODEL"),
+            },
         )
     else:  # chat / routine / event — run the entrypoint, then serve interactive messages
         # Research-capable toolset: WEB search/fetch + the workspace tools. Writes are committed by

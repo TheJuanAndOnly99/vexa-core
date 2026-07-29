@@ -12,11 +12,26 @@ import { onGatewayWSConnected, onMeetingStatus } from "./gatewayWS";
 interface MeetingRowDTO {
   id: number | string;
   platform: string;
-  native_meeting_id: string;
+  native_meeting_id: string | null;   // null on a link-less PLANNED meeting (platform 'unknown')
   status: string;
+  shared?: boolean;   // surfaced via a share/membership (not owned by the caller)
   start_time?: string | null;
   end_time?: string | null;
-  data?: { recordings?: unknown[]; docs?: { workspace: string; path: string; title?: string; kind?: string }[]; scheduled_at?: string; stop_requested?: boolean } | null;
+  constructed_meeting_url?: string | null;
+  data?: {
+    recordings?: unknown[];
+    docs?: { workspace: string; path: string; title?: string; kind?: string }[];
+    scheduled_at?: string;
+    stop_requested?: boolean;
+    // planned-meeting keys (POST /meetings / calendar sync)
+    title?: string;
+    workspace_id?: string;
+    calendar_uid?: string;
+    auto_join?: boolean;
+    auto_join_error?: string;
+    constructed_meeting_url?: string;
+    attendees?: { email: string; name?: string; partstat?: string }[];
+  } | null;
 }
 
 /** `stopped` is not a DB enum value — it's derived from a terminal `completed` row that the user stopped
@@ -31,6 +46,70 @@ interface SegmentDTO {
   start?: number | null;
   speaker?: string | null;
   text?: string | null;
+}
+
+/** A persisted processed note from the durable store (`data.processed.views[].doc.notes[]`,
+ *  written by meeting-api's db-writer from the copilot's proc stream). SAME producer and shape as
+ *  the live SSE `note` event payload — {id, speaker, chapter, text, t?, pass, frozen}. */
+export interface ProcessedNoteDTO {
+  id: string;
+  speaker?: string;
+  chapter?: string;
+  text: string;
+  t?: number;
+  tsMs?: number;   // absent in the durable store (live-only anchor); optional so the merged union renders
+  pass?: number;
+  frozen?: boolean;
+}
+
+/** The copilot view id inside data.processed.views[] (mirrors meeting-api's PROC_VIEW_ID). */
+const COPILOT_NOTES_VIEW_ID = "copilot-notes";
+
+interface ProcessedViewDTO { id?: string; doc?: { notes?: unknown[] } | null }
+interface TranscriptResponseDTO {
+  segments?: SegmentDTO[];
+  data?: { processed?: { views?: ProcessedViewDTO[] } | null } | null;
+}
+
+/** Both durable halves of a meeting's transcript response: the raw segments (mapped for the
+ *  transcript pane) and the copilot's persisted processed notes. */
+export interface DurableTranscript {
+  lines: TranscriptLine[];
+  notes: ProcessedNoteDTO[];
+}
+
+/** Pull the copilot-notes view's notes out of a transcript response body. Exported for tests. */
+export function processedNotesOf(body: TranscriptResponseDTO | null | undefined): ProcessedNoteDTO[] {
+  const views = body?.data?.processed?.views;
+  if (!Array.isArray(views)) return [];
+  const view = views.find((v) => v?.id === COPILOT_NOTES_VIEW_ID);
+  const raw = view?.doc?.notes;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((n): n is Record<string, unknown> => !!n && typeof n === "object")
+    .map((n) => ({
+      id: String(n.id ?? "").trim(),
+      speaker: typeof n.speaker === "string" ? n.speaker : undefined,
+      chapter: typeof n.chapter === "string" ? n.chapter : undefined,
+      text: typeof n.text === "string" ? n.text : "",
+      t: typeof n.t === "number" && Number.isFinite(n.t) ? n.t : undefined,
+      pass: typeof n.pass === "number" ? n.pass : undefined,
+      frozen: typeof n.frozen === "boolean" ? n.frozen : undefined,
+    }))
+    .filter((n) => n.id && n.text.trim());
+}
+
+/** Merge live note deltas OVER a durable seed by note id (the backend's own merge rule — a live
+ *  re-emit of a persisted note updates it in place, never duplicates). Seed order is preserved;
+ *  notes only seen live append in arrival order. Exported for tests. */
+export function mergeNotesById<T extends { id: string }>(seed: T[], live: T[]): T[] {
+  if (!seed.length) return live;
+  if (!live.length) return seed;
+  const seedIds = new Set(seed.map((n) => n.id));
+  const liveById = new Map(live.map((n) => [n.id, n]));
+  const out: T[] = seed.map((n) => liveById.get(n.id) ?? n);
+  for (const n of live) if (!seedIds.has(n.id)) out.push(n);
+  return out;
 }
 
 function formatTranscriptTime(start?: number | null): string {
@@ -50,6 +129,7 @@ function formatTranscriptTime(start?: number | null): string {
 const LIVE_STATUSES = new Set(["active", "joining", "requested", "awaiting_admission", "needs_help", "stopping"]);
 
 let meetings: MeetingMock[] = [];
+let wsConnected = false;   // the live meeting.status stream's connection state — part of the store's external state
 const subs = new Set<() => void>();
 let started = false;
 let wsUnsub: (() => void) | null = null;
@@ -58,6 +138,13 @@ let storeRevision = 0;
 
 function whenLabel(d: MeetingRowDTO, live: boolean): string {
   if (live) return "Now · live";
+  // a PLANNED meeting's row shows its planned time, not "Recorded"
+  if ((d.status === "scheduled" || d.status === "idle") && !d.start_time) {
+    const at = d.data?.scheduled_at;
+    if (!at) return "No time set";
+    try { return new Date(at).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }); }
+    catch { return "Scheduled"; }
+  }
   if (!d.start_time) return "Recorded";
   try { return new Date(d.start_time).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }); }
   catch { return "Recorded"; }
@@ -67,15 +154,37 @@ function toMock(d: MeetingRowDTO): MeetingMock {
   const raw = displayStatus(d);
   const live = LIVE_STATUSES.has(d.status);
   const native = d.native_meeting_id;
+  // P0 (cross-tenant leak + wrong-row hydration fix): the tab identity + the live SUBSCRIBE key is the
+  // meetings-domain ROW id (`d.id`), NOT the native code. The native id is NOT unique — it collides
+  // across a user's re-sends of the same link (distinct rows) and across DIFFERENT tenants. Keying the
+  // tab/subscribe by the row id makes every row a DISTINCT meeting: it subscribes to its OWN row-keyed
+  // transcript stream (`tc:meeting:{id}`) and its OWN copilot out-stream (`agent-meet-{id}`), and fetches
+  // its OWN durable transcript by id. The native id rides on `native_id` for DISPLAY + bot actions
+  // (send/stop target the native), and the readable meeting-doc name.
+  const id = String(d.id);
   return {
-    id: native,
-    native_id: native,
-    session_uid: live ? native : undefined,  // only live meetings subscribe to the copilot stream
-    title: `${d.platform === "google_meet" ? "Google Meet" : d.platform} · ${native}`,
+    id,
+    native_id: native ?? undefined,
+    session_uid: live ? id : undefined,  // only live meetings subscribe to the copilot stream — by ROW id
+    // a planned meeting's user-given title wins; otherwise the platform·native fallback
+    // Honest fallbacks (design-spec W3): a link-less plan is "Untitled meeting", never
+    // "unknown · (no link)"; a linked one reads "Google Meet · abc-defg-hij".
+    title: d.data?.title
+      || (native ? `${d.platform === "google_meet" ? "Google Meet" : d.platform} · ${native}` : "Untitled meeting"),
+    title_custom: d.data?.title ?? undefined,
     when: whenLabel(d, live),
     status: live ? "live" : "past",
     live_status: raw,
+    shared: !!d.shared,   // owned by someone else, surfaced via a share/membership (data.shared)
     scheduled_at: d.data?.scheduled_at ?? undefined,
+    workspace_id: d.data?.workspace_id ?? undefined,
+    calendar_uid: d.data?.calendar_uid ?? undefined,
+    attendees: d.data?.attendees ?? undefined,
+    auto_join: d.data?.auto_join,
+    auto_join_error: d.data?.auto_join_error ?? undefined,
+    meeting_url: d.constructed_meeting_url ?? d.data?.constructed_meeting_url ?? undefined,
+    start_time: d.start_time ?? undefined,
+    end_time: d.end_time ?? undefined,
     platform: d.platform === "google_meet" ? "Google Meet" : d.platform,
     has_recording: !!(d.data?.recordings?.length),
     docs: d.data?.docs ?? [],
@@ -95,11 +204,15 @@ async function snapshot() {
     const r = await fetch("/api/meetings", { cache: "no-store" });
     const { meetings: list } = (await r.json()) as { meetings: MeetingRowDTO[] };
     if (revision !== storeRevision) return;
-    // meeting-api returns one row per bot-launch; the same Meet relaunched yields several rows with the
-    // same native code. Dedupe to ONE row per native (newest wins — the list is newest-first).
+    // P0: meeting-api returns one row per bot-launch. Each row is a DISTINCT meeting run (its own
+    // transcript/processed doc), so we keep them ALL — no longer collapsed to one row per native (that
+    // collapse hydrated the wrong row's notes). Dedup is keyed by the ROW id purely to defend against a
+    // duplicated row in the list (idempotent), never to merge distinct rows sharing a native.
     const seen = new Set<string>();
     const next = (list || []).map(toMock).filter((m) => !seen.has(m.id) && (seen.add(m.id), true));
-    const key = (m: MeetingMock[]) => m.map((x) => `${x.id}|${x.live_status}|${x.has_recording}`).join(",");
+    const key = (m: MeetingMock[]) => m.map((x) =>
+      `${x.id}|${x.live_status}|${x.has_recording}|${x.title_custom ?? ""}|${x.scheduled_at ?? ""}|${x.workspace_id ?? ""}|${x.auto_join ?? ""}|${x.auto_join_error ?? ""}|${x.native_id ?? ""}|${(x.attendees ?? []).map((a) => a.email).join("+")}`,
+    ).join(",");
     if (key(next) !== key(meetings)) {
       meetings = next;
       subs.forEach((f) => f());
@@ -114,17 +227,27 @@ async function snapshot() {
  *  re-snapshot so a freshly-created (scheduled/idle) meeting surfaces. */
 function applyFrame(f: { meeting_id?: number | string; native?: string; status: string; when?: string }) {
   storeRevision += 1;
+  // P0: match the ROW id first (`meeting_id`) — a native-only match would patch EVERY row sharing that
+  // native (several distinct meetings), flipping the wrong rows' status. Fall back to native only when
+  // the frame carries no row id (older producer), accepting that ambiguity for that legacy frame shape.
   const i = meetings.findIndex(
-    (m) => (f.native && m.native_id === f.native) || (f.meeting_id != null && m.id === String(f.meeting_id)),
+    (m) => (f.meeting_id != null && m.id === String(f.meeting_id)) || (f.native != null && f.meeting_id == null && m.native_id === f.native),
   );
   if (i < 0) { void snapshot(); return; }
+  // a DELETED row (calendar sync retiring a planned meeting) leaves the store — patching it in
+  // place made a cancelled future meeting masquerade as "Recorded" until the next snapshot
+  if (f.status === "deleted") {
+    meetings = [...meetings.slice(0, i), ...meetings.slice(i + 1)];
+    subs.forEach((fn) => fn());
+    return;
+  }
   const live = LIVE_STATUSES.has(f.status);
   const cur = meetings[i];
   const nextRow: MeetingMock = {
     ...cur,
     live_status: f.status,
     status: live ? "live" : "past",
-    session_uid: live ? cur.native_id : undefined,
+    session_uid: live ? cur.id : undefined,  // subscribe by the ROW id (P0)
     scheduled_at: f.status === "scheduled" ? (f.when ?? cur.scheduled_at) : cur.scheduled_at,
   };
   meetings = [...meetings.slice(0, i), nextRow, ...meetings.slice(i + 1)];
@@ -137,26 +260,49 @@ function ensureStarted() {
   void snapshot();                          // initial snapshot on mount
   wsUnsub = onMeetingStatus(applyFrame);    // then live status deltas over the gateway WS
   connUnsub = onGatewayWSConnected((ok) => {
+    // Propagate connected-ness into the store's external state: consumers (the meeting header's
+    // bot controls) must know when the rows are a possibly-stale snapshot rather than live truth
+    // (issue #674) — a disconnected store never silently serves stale rows as current.
+    if (wsConnected !== ok) {
+      wsConnected = ok;
+      subs.forEach((f) => f());
+    }
     if (ok) void snapshot();
   });
 }
 
-/** Fetch a PAST meeting's recorded transcript over REST (gateway → meeting-api). Maps each segment to a
- *  TranscriptLine for the transcript pane. Returns [] on error / no transcript. */
-export async function fetchTranscript(platform: string, nativeId: string): Promise<TranscriptLine[]> {
-  // the platform on the mock is display-cased ("Google Meet") — normalise back to the API slug
-  const slug = platform === "Google Meet" ? "google_meet" : platform.toLowerCase().replace(/\s+/g, "_");
+const EMPTY_DURABLE: DurableTranscript = { lines: [], notes: [] };
+
+/** Fetch a meeting's DURABLE transcript over REST (gateway → meeting-api): the recorded segments
+ *  for the transcript pane PLUS the copilot's persisted processed notes (data.processed.views —
+ *  the copilot-notes view). For a past meeting this is THE source; for a live one it seeds
+ *  whatever was persisted before the client connected. Returns empties on error.
+ *
+ *  P0 (wrong-row hydration fix): fetch by the meetings-domain ROW id via
+ *  `GET /api/transcripts/by-id/{meetingId}` (owner-scoped downstream). The native path
+ *  (`/transcripts/{platform}/{native}`) resolves to the NEWEST row for that native, so a user with
+ *  several rows on the same link always read the latest — the notes of an OLDER row vanished. Fetching
+ *  by the exact row id returns THAT row's segments + processed notes, never a sibling's (and never
+ *  another tenant's). `meetingId` is the row id the mock now carries as `id`. */
+export async function fetchDurableTranscript(meetingId: string): Promise<DurableTranscript> {
   try {
-    const r = await fetch(`/api/transcripts/${slug}/${encodeURIComponent(nativeId)}`, { cache: "no-store" });
-    if (!r.ok) return [];
-    const { segments } = (await r.json()) as { segments?: SegmentDTO[] };
-    const list = segments || [];
-    return list
+    const r = await fetch(`/api/transcripts/by-id/${encodeURIComponent(meetingId)}`, { cache: "no-store" });
+    if (!r.ok) return EMPTY_DURABLE;
+    const body = (await r.json()) as TranscriptResponseDTO;
+    const list = body.segments || [];
+    const lines = list
       .filter((s) => (s.text ?? "").trim())
       .map((s) => ({ t: formatTranscriptTime(s.start), speaker: s.speaker || "Speaker", text: s.text ?? "" }));
+    return { lines, notes: processedNotesOf(body) };
   } catch {
-    return [];
+    return EMPTY_DURABLE;
   }
+}
+
+/** Fetch a PAST meeting's recorded transcript lines (segments only), by the ROW id. Kept for callers
+ *  that don't need the processed notes. */
+export async function fetchTranscript(meetingId: string): Promise<TranscriptLine[]> {
+  return (await fetchDurableTranscript(meetingId)).lines;
 }
 
 /** Last-known meeting by id (sync) — lets non-hook lookups resolve a real meeting. */
@@ -173,6 +319,18 @@ export function liveMeetingsNow(): MeetingMock[] {
  *  list reflects the new status immediately, even before the echoing WS frame lands. */
 export function refreshMeetings(): void {
   void snapshot();
+}
+
+/** Subscribe a component to the live `meeting.status` stream's CONNECTION state. `false` means the
+ *  rows are the last snapshot, not live truth — state-bearing controls (Stop bot …) must degrade
+ *  to indeterminate/disabled until it is `true` again (ws.v1 is the authoritative state channel). */
+export function useLiveMeetingsConnection(): boolean {
+  ensureStarted();
+  return useSyncExternalStore(
+    (cb) => { subs.add(cb); return () => subs.delete(cb); },
+    () => wsConnected,
+    () => false,
+  );
 }
 
 /** Subscribe a component to the meetings feed (live + past). */

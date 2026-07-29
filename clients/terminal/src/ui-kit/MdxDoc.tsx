@@ -11,84 +11,23 @@
  *  so the doc always displays — worst case it loses interactivity, never the page.
  */
 "use client";
-import { createContext, useContext, useEffect, useState, type CSSProperties, type ReactNode } from "react";
+import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
 import * as runtime from "react/jsx-runtime";
 import { evaluate } from "@mdx-js/mdx";
 import remarkGfm from "remark-gfm";
-import { OPEN_ENTITY_EVENT } from "../canvas/actions";
 import { Markdown } from "./Markdown";
 import { Icon } from "./index";
+import {
+  Card, CardGroup, DocMetaContext, DocNavContext, ENTITY_CHIP, DEFAULT_ENTITY_CHIP, InternalLink,
+  Wikilink, isInternalHref, type DocNavigate,
+} from "./docLinks";
 
-export type DocNavigate = (detail: { path?: string; wikilink?: string }) => void;
-/** Obsidian-style in-place navigation: the hosting doc pane provides a navigate fn so
- *  links replace the pane's content (with its own back/forward history). Outside a doc
- *  pane (chat, demo page) links fall back to opening a workbench tab. */
-export const DocNavContext = createContext<DocNavigate | null>(null);
-
-function useOpenEntity(): DocNavigate {
-  const nav = useContext(DocNavContext);
-  return nav ?? ((detail) => {
-    if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent(OPEN_ENTITY_EVENT, { detail }));
-  });
-}
+// Link/wikilink resolution + the entity chips live in ./docLinks (ONE resolver shared with
+// the plain-Markdown fallback and the workbench event handler). Re-exported for existing
+// importers (surfaces/workspace.tsx, mdx-demo).
+export { DocMetaContext, DocNavContext, ENTITY_CHIP, DEFAULT_ENTITY_CHIP, type DocNavigate };
 
 // ── component registry (closed vocabulary — mirrors Mintlify tag names) ─────────
-
-// Entity-type → chip style (mirrors the TYPE map in surfaces/entities.tsx). Unknown or
-// unresolvable types (e.g. /mdx-demo with no gateway) fall back to the neutral blue chip.
-export const ENTITY_CHIP: Record<string, { icon: string; color: string; bg: string }> = {
-  person: { icon: "user", color: "var(--blue)", bg: "var(--bluebg)" },
-  company: { icon: "building", color: "var(--accent)", bg: "var(--accentbg)" },
-  organization: { icon: "web", color: "var(--violet)", bg: "var(--violetbg)" },
-  project: { icon: "zap", color: "var(--green)", bg: "var(--greenbg)" },
-  meeting: { icon: "cal", color: "var(--violet)", bg: "var(--violetbg)" },
-  task: { icon: "tasks", color: "var(--green)", bg: "var(--greenbg)" },
-};
-export const DEFAULT_ENTITY_CHIP = { icon: "link", color: "var(--blue)", bg: "var(--bluebg)" };
-
-// title → entity type, resolved once per session from the workspace tree
-// (slugified title matched against kg/entities/<type>/<slug>.md).
-const slugify = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-let typeMapPromise: Promise<Map<string, string>> | null = null;
-function entityTypes(): Promise<Map<string, string>> {
-  typeMapPromise ??= import("../surfaces/workspaceApi")
-    .then((api) => api.listWorkspaceTree())
-    .then((paths) => {
-      const map = new Map<string, string>();
-      for (const p of paths ?? []) {
-        const m = p.match(/(?:^|\/)kg\/entities\/([^/]+)\/([^/]+)\.md$/);
-        if (m && m[2] !== "index") map.set(m[2], m[1]);
-      }
-      return map;
-    })
-    .catch(() => new Map<string, string>());
-  return typeMapPromise;
-}
-
-/** Rich entity chip for [[wikilinks]] — typed pill (icon + color per entity type). */
-function Wikilink({ title }: { title: string }) {
-  const [hover, setHover] = useState(false);
-  const [type, setType] = useState<string | null>(null);
-  useEffect(() => {
-    let on = true;
-    void entityTypes().then((m) => { if (on) setType(m.get(slugify(title)) ?? null); });
-    return () => { on = false; };
-  }, [title]);
-  const c = (type && ENTITY_CHIP[type]) || DEFAULT_ENTITY_CHIP;
-  const openEntity = useOpenEntity();
-  return (
-    <span onClick={() => openEntity({ wikilink: title })}
-      onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}
-      style={{ display: "inline-flex", alignItems: "center", gap: 5, verticalAlign: "baseline",
-        background: hover ? c.bg : "var(--panel2)",
-        border: `1px solid ${hover ? c.color : "var(--line)"}`, borderRadius: 999,
-        padding: "0.5px 9px 0.5px 7px", color: c.color, fontSize: "0.92em",
-        fontWeight: 500, cursor: "pointer", whiteSpace: "nowrap", lineHeight: 1.45 }}>
-      <Icon name={c.icon} size={11} style={{ opacity: 0.8 }} />
-      {title}
-    </span>
-  );
-}
 
 function Callout({ tone, icon, children }: { tone: "blue" | "accent"; icon: string; children?: ReactNode }) {
   const color = tone === "blue" ? "var(--blue)" : "var(--accent)";
@@ -102,32 +41,8 @@ function Callout({ tone, icon, children }: { tone: "blue" | "accent"; icon: stri
 const Note = ({ children }: { children?: ReactNode }) => <Callout tone="blue" icon="info">{children}</Callout>;
 const Warning = ({ children }: { children?: ReactNode }) => <Callout tone="accent" icon="alert">{children}</Callout>;
 
-function Card({ title, icon, href, children }: { title?: string; icon?: string; href?: string; children?: ReactNode }) {
-  const [hover, setHover] = useState(false);
-  const clickable = Boolean(href);
-  const openEntity = useOpenEntity();
-  const open = () => {
-    if (!href) return;
-    // scheme allowlist: http(s) opens externally, scheme-less opens in-workspace,
-    // anything else (javascript:, data:, //host) is untrusted-doc content — ignore
-    if (/^https?:/i.test(href)) window.open(href, "_blank", "noreferrer");
-    else if (!/^[a-z][a-z0-9+.-]*:/i.test(href) && !href.startsWith("//")) openEntity({ path: href.replace(/^\.\//, "") });
-  };
-  return (
-    <div onClick={clickable ? open : undefined} onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}
-      style={{ border: `1px solid ${hover && clickable ? "var(--line2)" : "var(--line)"}`, borderRadius: 10, background: hover && clickable ? "var(--panel2)" : "var(--panel)", padding: "12px 14px", cursor: clickable ? "pointer" : undefined, minWidth: 0 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: children ? 6 : 0 }}>
-        {icon && <span style={{ color: "var(--blue)" }}><Icon name={icon} size={14} /></span>}
-        <span style={{ fontWeight: 600, color: "var(--t1)", fontSize: 13.5 }}>{title}</span>
-      </div>
-      <div style={{ color: "var(--t2)", fontSize: 13, lineHeight: 1.5 }}>{children}</div>
-    </div>
-  );
-}
-
-function CardGroup({ cols = 2, children }: { cols?: number; children?: ReactNode }) {
-  return <div style={{ display: "grid", gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`, gap: 10, margin: "8px 0 12px" }}>{children}</div>;
-}
+// Card + CardGroup live in ./docLinks — shared with the plain-Markdown fallback so the
+// same link-card UI renders whether or not the doc compiles as MDX.
 
 function Steps({ children }: { children?: ReactNode }) {
   const items = Array.isArray(children) ? children : [children];
@@ -185,17 +100,9 @@ const htmlComponents = {
   p: ({ children }: { children?: ReactNode }) => <p style={{ margin: "0 0 8px", lineHeight: 1.6 }}>{children}</p>,
   a: ({ href, children }: { href?: string; children?: ReactNode }) => {
     // Workspace-internal link (no scheme, not an anchor) → navigate the doc pane in place
-    // (or open a tab outside a doc pane), same path the Wikilink chip uses. External links
-    // open a browser tab.
-    const openEntity = useOpenEntity();
-    const internal = Boolean(href) && !/^[a-z][a-z0-9+.-]*:/i.test(href!) && !href!.startsWith("#") && !href!.startsWith("//");
-    if (internal) {
-      const path = href!.replace(/^\.\//, "");
-      return (
-        <span role="link" onClick={() => openEntity({ path })}
-          style={{ color: "var(--blue)", textDecoration: "underline", cursor: "pointer" }}>{children}</span>
-      );
-    }
+    // (or open a tab outside a doc pane), same path the Wikilink chip uses. Relative hrefs
+    // resolve against the linking doc's directory. External links open a browser tab.
+    if (href && isInternalHref(href)) return <InternalLink href={href}>{children}</InternalLink>;
     // external: only http(s) and #anchors keep a live href — javascript:/data:/;
     // //host from untrusted docs render as inert text
     const safeHref = href && (/^https?:/i.test(href) || href.startsWith("#")) ? href : undefined;
@@ -247,11 +154,24 @@ function remarkForbidExecutable() {
   return (tree: { type?: string; children?: unknown[] }) => assertNoExecutableMdx(tree);
 }
 
-// ── wikilink preprocessing: [[Title]] → <Wikilink title="Title" /> (skip code) ───
+// ── prose preprocessing (code spans/fences untouched) ────────────────────────────
+// 1. escape `<` that doesn't start a known tag — agent-written docs routinely carry raw
+//    angle-bracket text (`<meeting_id>`, `a<b`, `<url>`) that would otherwise abort the
+//    whole MDX compile and downgrade the doc to the plain renderer;
+// 2. rewrite [[Title]] → <Wikilink title="Title" /> (after escaping, so the injected tag
+//    survives).
+const KNOWN_TAGS = "Note|Warning|CardGroup|Card|Steps|Step|Tabs|Tab|Wikilink" +
+  // no single-letter html tags (b, i): `a<b then` in prose is far likelier than a raw
+  // <b> tag, and an unclosed <b would abort the compile this pass exists to save
+  "|a\\b|br|blockquote|code|details|div|em|h[1-6]|hr|img|kbd|li|ol|p\\b|pre|span|strong|sub|summary|sup|table|tbody|td|th|thead|tr|ul";
+const UNKNOWN_TAG_OPEN = new RegExp(`<(?!/?(?:${KNOWN_TAGS})(?:[\\s/>]|$))`, "g");
+export function escapeUnknownTags(seg: string): string {
+  return seg.replace(UNKNOWN_TAG_OPEN, "\\<");
+}
 function transformWikilinks(src: string): string {
   // split out fenced code blocks and inline code; only rewrite prose segments
   return src.split(/(```[\s\S]*?```|`[^`]*`)/g).map((seg, i) =>
-    i % 2 === 1 ? seg : seg.replace(/\[\[([^\]]+)\]\]/g, (_m, t: string) => `<Wikilink title=${JSON.stringify(t)} />`),
+    i % 2 === 1 ? seg : escapeUnknownTags(seg).replace(/\[\[([^\]]+)\]\]/g, (_m, t: string) => `<Wikilink title=${JSON.stringify(t)} />`),
   ).join("");
 }
 
@@ -279,7 +199,11 @@ export function MdxDoc({ children, style }: { children: string; style?: CSSPrope
   if (state.status === "fallback") {
     return (
       <div style={style}>
-        <div title={state.error} style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: "var(--t3)", marginBottom: 8 }}>plain markdown (MDX parse failed)</div>
+        {/* fail-loud: name the downgrade AND the reason inline — a tooltip-only error is
+            invisible in screenshots and to anyone who doesn't hover */}
+        <div style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: "var(--t3)", marginBottom: 8 }}>
+          simplified rendering (MDX failed: {state.error})
+        </div>
         <Markdown>{src}</Markdown>
       </div>
     );

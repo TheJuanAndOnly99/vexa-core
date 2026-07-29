@@ -438,6 +438,7 @@ def serve_meeting(
     cursor_key: str | None = None,
     on_proc_note: Callable[[dict], None] | None = None,
     on_envelope: Callable[[dict], None] | None = None,
+    proc_params: dict | None = None,
 ) -> None:
     """Consume the meeting's ``transcript.v1`` Stream (the meetings⊥agent seam — read by schema), gate
     cheaply (a NEW speaker, or ``beat_segments`` segments), and run a copilot beat that XADDs proactive
@@ -470,15 +471,24 @@ def serve_meeting(
         except Exception:  # noqa: BLE001 — render-source mirror is an optimization; never crash the loop
             log.warning("serve_meeting: on_envelope persist failed", exc_info=True)
 
+    mirror_dirty: dict[str, dict] = {}  # note id → latest merged note, awaiting a mirror flush
+
     def _emit_proc_note(note: dict) -> None:
-        """XADD ONE cleaned note (id == segment_id) onto the per-meeting processed STREAM — the reliable
-        1:1 CLEANED transcript channel, SEPARATE from the cards beat on ``out_topic`` — and ALSO upsert it
-        into the per-meeting workspace file (Auth-B/#3a) via ``on_proc_note``, so a chat agent can Read the
-        meeting context incrementally. Both are best-effort over the same 1:1 cleaned note."""
+        """XADD ONE cleaned note (id == segment_id) onto the per-meeting processed STREAM — the ONE
+        live carrier of cleaned notes (processed-notes.v1; the SSE tails it, the db-writer persists
+        it) — and accumulate it into the running envelope + the mirror batch. The workspace-file and
+        envelope mirrors are DERIVED views flushed per beat / at session_end (ADR 0027) — writing
+        them per note was an O(n²) rewrite in the hot loop."""
         if not note:
             return
         if proc_stream:
-            stream.xadd(proc_stream, {"note": json.dumps(note)})
+            fields = {"note": json.dumps(note)}
+            if proc_params:
+                # The processing metadata APPLIED (provider/model/pipeline) rides every entry so the
+                # durable consumer (meeting-api db-writer → meeting.data processed views) records
+                # reproducible provenance for the view it persists.
+                fields["params"] = json.dumps(proc_params)
+            stream.xadd(proc_stream, fields)
         # Accumulate the SAME 1:1 cleaned note (keyed by id) into the running envelope notes — a refining
         # pass UPDATES its line in place rather than duplicating, exactly like the markdown upsert.
         nid = str(note.get("id") or "").strip()
@@ -489,14 +499,21 @@ def serve_meeting(
                 notes.append(note)
             else:
                 existing.update(note)
+            mirror_dirty[nid] = notes_by_id[nid]
+
+    def _flush_mirror() -> None:
+        """Flush the DERIVED views (per beat + session_end): upsert each dirty note into the
+        per-meeting workspace file (Auth-B/#3a — a chat agent can Read the meeting mid-flight) and
+        re-persist the envelope render source. Best-effort — mirrors never crash the live loop."""
         if on_proc_note is not None:
-            try:
-                on_proc_note(note)
-            except Exception:  # noqa: BLE001 — the workspace mirror is an optimization; never crash the loop
-                log.warning("serve_meeting: on_proc_note upsert failed", exc_info=True)
-        # Persist the envelope as the durable render source whenever the markdown mirror updates — the
-        # worker tracks notes + accumulated cards; we do not recompute either.
-        _persist_envelope()
+            for note in mirror_dirty.values():
+                try:
+                    on_proc_note(note)
+                except Exception:  # noqa: BLE001 — the workspace mirror is an optimization
+                    log.warning("serve_meeting: on_proc_note upsert failed", exc_info=True)
+        if mirror_dirty:
+            _persist_envelope()
+        mirror_dirty.clear()
 
     def _run_beat(segs: list[dict], idx: int) -> None:
         tid = f"beat{idx}"
@@ -507,13 +524,17 @@ def serve_meeting(
             elif ev.get("type") == "note":
                 # The LLM rewrite returned a valid note for this id → UPGRADE the cleaned-stream text
                 # (baseline already emitted at ingest; this is the richer pass, still 1:1 by segment_id).
+                # Notes ride ONLY processed-notes.v1 — the out-stream is cards + agent activity, per
+                # its name (ADR 0027 carrier collapse; the SSE tails the proc stream directly).
                 _emit_proc_note(ev.get("note") or {})
+                continue
             stream.xadd(out_topic, {"event": json.dumps({**ev, "turn_id": tid})})
         stream.xadd(out_topic, {"event": json.dumps({"type": "turn-complete", "turn_id": tid})})
         sent_ids = {id(seg) for seg in segs}
         for seg in processing_window:
             if id(seg) in sent_ids:
                 seg["_rewrite_passes"] = int(seg.get("_rewrite_passes", 0)) + 1
+        _flush_mirror()
 
     while True:
         resp = stream.xread({transcript_stream: last}, count=50, block=idle_ms)
@@ -529,7 +550,19 @@ def serve_meeting(
                     if mutable and enabled:
                         n += 1
                         _run_beat(mutable, n)
+                    _flush_mirror()      # ingest-only notes (no beat ran) reach the mirrors too
                     _persist_envelope()  # final durable render source (notes + accumulated cards)
+                    # processed-notes.v1 ``view_end`` (ADR 0027): the stream is COMPLETE here — the
+                    # final beat has run and every note is emitted. The db-writer flushes the durable
+                    # view ON this marker (its bounded deadline covers a worker that dies without one);
+                    # the live SSE closes on it. Emitted BEFORE the doc turn (30s+ of LLM the durable
+                    # flush must not wait on) and regardless of ``enabled`` (baseline notes flow even
+                    # with live beats off — the emit gate is proc_stream, same as _emit_proc_note's).
+                    if proc_stream:
+                        end_marker: dict = {"type": "view_end"}
+                        if last and last != "0":
+                            end_marker["cursor"] = str(last)
+                        stream.xadd(proc_stream, end_marker)
                     if doc_turn is not None:  # post-meeting WRITE: author/update the kg meeting entity
                         _emit_turn(stream, out_topic, lambda: doc_turn(cards), "meeting-doc")
                     return  # meeting ended → reap

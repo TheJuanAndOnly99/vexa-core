@@ -9,7 +9,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+from contextlib import asynccontextmanager
 from typing import Optional
+
+# fastapi-guard: keep it installed (so the integration is exercised) but in-memory and with
+# rate limiting off, so the unit suite never depends on Redis and guard can never throttle/
+# block a unit-test request. GUARD_WS_ENABLED is left unset (default false) so the WS path
+# is unchanged for the existing multiplex suite.
+os.environ.setdefault("GUARD_ENABLED", "true")
+os.environ.setdefault("GUARD_ENABLE_REDIS", "false")
+os.environ.setdefault("GUARD_RATE_LIMIT_RPM", "0")
 
 VALID_KEY = "vxa_test_unit_key"
 VALID_USER = {"user_id": 7, "scopes": ["bot", "tx", "browser"], "max_concurrent": 3, "email": "u@example.com"}
@@ -55,10 +65,13 @@ class FakeDownstream:
 
     def __init__(self, status_code: int = 200, body: Optional[dict] = None,
                  content_type: str = "application/json",
-                 stream_chunks: Optional[list] = None):
+                 stream_chunks: Optional[list] = None,
+                 extra_headers: Optional[dict] = None):
         self.status_code = status_code
         self._body = body if body is not None else {"ok": True}
         self._content_type = content_type
+        # extra downstream response headers (e.g. Content-Range/Accept-Ranges on a 206)
+        self._extra_headers = extra_headers or {}
         # canned SSE frames for the streaming (agent chat) path
         self._stream_chunks = stream_chunks if stream_chunks is not None else [
             b'data: {"type":"token","text":"hi"}\n\n',
@@ -70,13 +83,32 @@ class FakeDownstream:
         self.last = {"method": method, "url": url, "headers": headers or {},
                      "params": params, "content": content}
         return _Resp(self.status_code, json.dumps(self._body).encode(),
-                     {"content-type": self._content_type})
+                     {"content-type": self._content_type, **self._extra_headers})
 
     async def stream(self, method, url, *, headers=None, params=None, content=None):
         self.last = {"method": method, "url": url, "headers": headers or {},
                      "params": params, "content": content}
         for chunk in self._stream_chunks:
             yield chunk
+
+    @asynccontextmanager
+    async def open_stream(self, method, url, *, headers=None, params=None, content=None):
+        """The head-aware streaming forward (``ports.StreamedResponse``): status + headers first,
+        then the canned chunks. Used by the relay leg (MCP), where the upstream's own verdict must
+        reach the caller instead of a gateway-minted envelope."""
+        self.last = {"method": method, "url": url, "headers": headers or {},
+                     "params": params, "content": content}
+        chunks = self._stream_chunks
+
+        class _Streamed:
+            status_code = self.status_code
+            headers = {"content-type": self._content_type, **self._extra_headers}
+
+            async def aiter_bytes(_self):
+                for chunk in chunks:
+                    yield chunk
+
+        yield _Streamed()
 
 
 class FakePubSub:

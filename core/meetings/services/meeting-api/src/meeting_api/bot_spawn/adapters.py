@@ -15,7 +15,41 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from ..sessions import new_session
-from .ports import DuplicateMeeting, MaxBotsExceeded, QuotaExceeded, SpawnFailed
+from .ports import (
+    DuplicateMeeting,
+    MaxBotsExceeded,
+    QuotaExceeded,
+    SpawnFailed,
+    WorkloadUnknown,
+    reconcile_grace_for_status,
+)
+
+
+def _reason(resp) -> str:
+    """The kernel's error reason from a non-201 runtime.v1 response — its ``{detail}`` (the sealed
+    contract defines no error shape, so the API uses FastAPI's default), falling back to the raw body
+    text. Lets the meeting-api 502 name WHY the spawn failed (e.g. the absent image) instead of a bare
+    status code (#718)."""
+    try:
+        body = resp.json()
+        if isinstance(body, dict) and body.get("detail"):
+            return str(body["detail"])
+    except Exception:  # noqa: BLE001 — a non-JSON error body falls back to text
+        pass
+    return (getattr(resp, "text", "") or "").strip() or f"HTTP {resp.status_code}"
+
+
+def _iso_utc(dt) -> Optional[str]:
+    """Serialize a datetime as an unambiguous UTC ISO-8601 string (``…Z``).
+
+    The meeting time columns are naive but hold UTC (the DB session is UTC). Emitting a bare
+    ``isoformat()`` yields a zone-less string that a browser's ``new Date()`` parses as LOCAL —
+    so the value renders offset by the viewer's UTC offset. Stamping UTC makes clients localize it.
+    """
+    if dt is None:
+        return None
+    aware = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return aware.isoformat().replace("+00:00", "Z")
 
 
 def _row_to_dict(m) -> dict:
@@ -27,11 +61,11 @@ def _row_to_dict(m) -> dict:
         "platform_specific_id": m.platform_specific_id,
         "status": m.status,
         "bot_container_id": m.bot_container_id,
-        "start_time": m.start_time.isoformat() if m.start_time else None,
-        "end_time": m.end_time.isoformat() if m.end_time else None,
+        "start_time": _iso_utc(m.start_time),
+        "end_time": _iso_utc(m.end_time),
         "data": m.data if isinstance(m.data, dict) else {},
-        "created_at": m.created_at.isoformat() if m.created_at else None,
-        "updated_at": m.updated_at.isoformat() if m.updated_at else None,
+        "created_at": _iso_utc(m.created_at),
+        "updated_at": _iso_utc(m.updated_at),
     }
 
 
@@ -55,6 +89,23 @@ class SqlAlchemyMeetingRepo:
                     Meeting.platform == platform,
                     Meeting.platform_specific_id == native_meeting_id,
                     Meeting.status.in_(["requested", "joining", "awaiting_admission", "active"]),
+                )
+                .order_by(Meeting.created_at.desc())
+            )
+            m = (await db.execute(stmt)).scalars().first()
+            return _row_to_dict(m) if m else None
+
+    async def find_active_by_userdata(self, userdata_s3_path) -> Optional[dict]:
+        from sqlalchemy import select
+
+        from ..sessions.models import Meeting
+
+        async with self._session_factory() as db:
+            stmt = (
+                select(Meeting)
+                .where(
+                    Meeting.status.in_(["requested", "joining", "awaiting_admission", "active", "stopping"]),
+                    Meeting.data["auth_userdata_path"].astext == userdata_s3_path,
                 )
                 .order_by(Meeting.created_at.desc())
             )
@@ -122,7 +173,11 @@ class SqlAlchemyMeetingRepo:
     async def find_by_container(self, *, bot_container_id) -> Optional[dict]:
         """The meeting + latest session for a workload id — used by the runtime callback (CC5) to drive a
         synthetic ``failed`` for a workload that died before the bot reported. ``{meeting_id, status,
-        session_uid}`` or ``None``."""
+        session_uid, stop_requested}`` or ``None``.
+
+        ``stop_requested`` carries the user's intent so the synthetic terminal can tell a bot the USER
+        abandoned from one that timed out on its own — the two earn different completion reasons, and
+        only the latter may be retried."""
         from sqlalchemy import select
 
         from ..sessions.models import Meeting, MeetingSession
@@ -130,12 +185,14 @@ class SqlAlchemyMeetingRepo:
         async with self._session_factory() as db:
             row = (
                 await db.execute(
-                    select(Meeting.id, Meeting.status).where(Meeting.bot_container_id == bot_container_id)
+                    select(Meeting.id, Meeting.status, Meeting.data).where(
+                        Meeting.bot_container_id == bot_container_id
+                    )
                 )
             ).first()
             if row is None:
                 return None
-            mid, status = row
+            mid, status, data = row
             sid = (
                 await db.execute(
                     select(MeetingSession.session_uid)
@@ -143,7 +200,12 @@ class SqlAlchemyMeetingRepo:
                     .order_by(MeetingSession.id.desc())
                 )
             ).scalars().first()
-            return {"meeting_id": mid, "status": status, "session_uid": sid}
+            return {
+                "meeting_id": mid,
+                "status": status,
+                "session_uid": sid,
+                "stop_requested": bool((data or {}).get("stop_requested")),
+            }
 
     async def update_meeting_status(
         self, *, session_uid, status, completion_reason=None, failure_stage=None, data=None
@@ -160,7 +222,9 @@ class SqlAlchemyMeetingRepo:
             if sess is None:
                 return  # unknown session (e.g. a self-host bot) — nothing to persist
             m = (
-                await db.execute(select(Meeting).where(Meeting.id == sess.meeting_id))
+                await db.execute(select(Meeting).where(Meeting.id == sess.meeting_id).with_for_update())
+                # FOR UPDATE: db-writer/recordings/docs all lock before read-modify-write of data
+                # JSONB; without it a concurrent db-writer merge commit is clobbered (#53 review).
             ).scalars().first()
             if m is None:
                 return
@@ -172,6 +236,20 @@ class SqlAlchemyMeetingRepo:
                 merged["failure_stage"] = failure_stage
             for k, v in (data or {}).items():
                 merged[k] = v
+            if status in ("completed", "failed"):
+                # Delivery marker (#807): `completed` alone means "the bot exited cleanly" — it says
+                # nothing about whether a transcript exists. Persisting the segment count at the
+                # terminal transition makes completed-but-empty meetings (roughly half of hosted
+                # completions) queryable and alertable instead of indistinguishable from successes.
+                from sqlalchemy import func as _func
+
+                from ..sessions.models import Transcription
+
+                merged["segments_captured"] = (
+                    await db.execute(
+                        select(_func.count()).select_from(Transcription).where(Transcription.meeting_id == m.id)
+                    )
+                ).scalar() or 0
             m.data = merged
             flag_modified(m, "data")
             # Naive UTC into the naive time columns (tz-aware → asyncpg DataError, per set_bot_container).
@@ -243,7 +321,7 @@ class SqlAlchemyMeetingRepo:
         return [(mid, sid, bcid) for mid, (sid, bcid) in out.items()]
 
     async def list_stale_nonterminal(
-        self, *, stop_grace: float, active_grace: float
+        self, *, stop_grace: float, active_grace: float, preactive_grace: Optional[float] = None
     ) -> list[tuple[int, str, str, Optional[str], bool]]:
         """Meetings stuck in ANY non-terminal status whose row has gone quiet past its grace window —
         a bot that exited (or vanished) without ever sending its terminal lifecycle callback leaves the
@@ -252,8 +330,10 @@ class SqlAlchemyMeetingRepo:
         CANDIDATE signal only — the sweep additionally gates the active-reap on runtime workload
         liveness (see ``reconcile.py``), because a silent-but-live bot stops bumping ``updated_at``.
 
-        Per-row window: ``stopping`` uses ``stop_grace`` (a stop was requested — clear it fast),
-        everything else uses ``active_grace`` (a longer idle so a momentarily-quiet live bot is not
+        Per-row window: ``stopping`` uses ``stop_grace`` (a stop was requested — clear it fast), a
+        PRE-ACTIVE row (`requested`/`joining`/`awaiting_admission` — the bot has not reached the
+        meeting yet, and holds the lobby budget the control plane handed it) uses ``preactive_grace``,
+        everything else ``active_grace`` (a longer idle so a momentarily-quiet live bot is not
         reaped). Returns ``[(meeting_id, status, session_uid, bot_container_id, stop_requested), …]`` with
         the LATEST session_uid per meeting (mirrors ``list_stale_stopping``)."""
         from datetime import datetime, timezone
@@ -281,7 +361,7 @@ class SqlAlchemyMeetingRepo:
             if mid in out or upd is None or not sid:
                 continue
             u = upd if upd.tzinfo else upd.replace(tzinfo=timezone.utc)
-            grace = stop_grace if status == "stopping" else active_grace
+            grace = reconcile_grace_for_status(status, stop_grace, active_grace, preactive_grace)
             if (now - u).total_seconds() >= grace:
                 stop_req = bool(isinstance(data, dict) and data.get("stop_requested"))
                 out[mid] = (status, sid, bcid, stop_req)
@@ -365,6 +445,33 @@ class SqlAlchemyMeetingRepo:
                 n_active = int((await db.execute(count_stmt)).scalar() or 0)
                 if n_active >= max_concurrent:
                     raise MaxBotsExceeded(user_id, max_concurrent)
+            # 2b. claim — a PLANNED row (intent status `idle`/`scheduled`, created by POST /meetings
+            #     or calendar sync) for the SAME (user, platform, native) is UPGRADED in place instead
+            #     of inserting a second row: without this, the unique partial index (which covers
+            #     intent statuses too) would 409 the spawn. The planned analog of ``reopen_meeting``,
+            #     atomic under the same advisory lock. Spawn keys merge OVER the planned data; the
+            #     plan's `title` / `scheduled_at` / `workspace_id` / `auto_join` / `calendar_uid`
+            #     survive — the plan, its workspace bind, and the transcript live on ONE row.
+            from sqlalchemy.orm.attributes import flag_modified
+
+            claimable = (await db.execute(
+                select(Meeting).where(
+                    Meeting.user_id == user_id,
+                    Meeting.platform == platform,
+                    Meeting.platform_specific_id == native_meeting_id,
+                    Meeting.status.in_(("idle", "scheduled")),
+                ).order_by(Meeting.created_at.desc()).limit(1).with_for_update()
+            )).scalars().first()
+            if claimable is not None:
+                planned = dict(claimable.data) if isinstance(claimable.data, dict) else {}
+                claimable.status = "requested"
+                claimable.end_time = None
+                claimable.bot_container_id = None
+                claimable.data = {**planned, **dict(data or {})}
+                flag_modified(claimable, "data")
+                await db.commit()
+                await db.refresh(claimable)
+                return _row_to_dict(claimable)
             # 3. insert — still inside the same txn/lock, so check+insert is atomic.
             m = Meeting(
                 user_id=user_id, platform=platform, platform_specific_id=native_meeting_id,
@@ -382,6 +489,47 @@ class SqlAlchemyMeetingRepo:
                 ) from e
             await db.refresh(m)
             return _row_to_dict(m)
+
+    async def list_scheduled_meetings(self) -> list[dict]:
+        """Every ``scheduled`` row with a joinable link (the auto-join sweep's candidate set —
+        the time/toggle/backoff filtering is the sweep's pure ``due_rows``)."""
+        from sqlalchemy import select
+
+        from ..sessions.models import Meeting
+
+        async with self._session_factory() as db:
+            rows = (await db.execute(
+                select(Meeting).where(
+                    Meeting.status == "scheduled",
+                    Meeting.platform_specific_id.isnot(None),
+                    Meeting.platform != "unknown",
+                )
+            )).scalars().all()
+            return [_row_to_dict(m) for m in rows]
+
+    async def merge_meeting_data(self, meeting_id, patch: dict) -> None:
+        """Merge ``patch`` into ``meeting.data`` (a ``None`` value REMOVES the key) — the sweep's
+        error/backoff stamping primitive. Row-locked; a missing row is a no-op."""
+        from sqlalchemy import select
+        from sqlalchemy.orm.attributes import flag_modified
+
+        from ..sessions.models import Meeting
+
+        async with self._session_factory() as db:
+            meeting = (await db.execute(
+                select(Meeting).where(Meeting.id == meeting_id).with_for_update()
+            )).scalars().first()
+            if meeting is None:
+                return
+            data = dict(meeting.data) if isinstance(meeting.data, dict) else {}
+            for k, v in patch.items():
+                if v is None:
+                    data.pop(k, None)
+                else:
+                    data[k] = v
+            meeting.data = data
+            flag_modified(meeting, "data")
+            await db.commit()
 
     async def create_session(self, *, meeting_id, session_uid) -> None:
         async with self._session_factory() as db:
@@ -417,6 +565,39 @@ class SqlAlchemyMeetingRepo:
             await db.refresh(m)
             return _row_to_dict(m)
 
+    async def fail_meeting(self, *, meeting_id, reason, failure_stage="requested") -> Optional[dict]:
+        """Mark a meeting ``failed`` BY ID (no session needed) — the spawn-time failure path (#718).
+
+        A workload dead on arrival (kernel ``start_failed``) is refused BEFORE the ``MeetingSession``
+        exists, so the session-keyed ``update_meeting_status`` cannot reach the row; this fails it
+        directly, stamping the reason into ``data`` so ``GET /meetings`` and the terminal show WHY
+        instead of leaving a ``requested`` row for the 5-minute reaper to flip reason-less. Row-locked;
+        a missing row is a no-op."""
+        from sqlalchemy import select
+        from sqlalchemy.orm.attributes import flag_modified
+
+        from ..sessions.models import Meeting
+
+        async with self._session_factory() as db:
+            m = (
+                await db.execute(select(Meeting).where(Meeting.id == meeting_id).with_for_update())
+            ).scalars().first()
+            if m is None:
+                return None
+            m.status = "failed"
+            merged = dict(m.data) if isinstance(m.data, dict) else {}
+            merged["failure_stage"] = failure_stage
+            merged["failure_reason"] = reason
+            merged["completion_reason"] = "start_failed"
+            m.data = merged
+            flag_modified(m, "data")
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            if m.end_time is None:
+                m.end_time = now
+            await db.commit()
+            await db.refresh(m)
+            return _row_to_dict(m)
+
 
 class HttpRuntimeClient:
     """``RuntimeClient`` over the runtime.v1 HTTP kernel (``POST /workloads``). 429 → QuotaExceeded;
@@ -431,20 +612,44 @@ class HttpRuntimeClient:
         if resp.status_code == 429:
             raise QuotaExceeded("runtime kernel: owner quota exceeded")
         if resp.status_code != 201:
-            raise SpawnFailed(f"runtime kernel returned {resp.status_code}")
-        return resp.json()
+            # Carry the kernel's own reason (its {detail}) so the 502 the user sees NAMES the cause
+            # — e.g. "No such image: …" for an absent bot image (#718 C1 → C2).
+            raise SpawnFailed(f"runtime kernel returned {resp.status_code}: {_reason(resp)}")
+        body = resp.json()
+        # Belt-and-suspenders (#718 C2): even a 201 must be a workload that actually STARTED. A kernel
+        # that answers 201 with a dead body (state=stopped/destroyed, e.g. start_failed) is dead on
+        # arrival — refuse it here too, so the adapter never trusts any kernel version's optimism.
+        state = body.get("state")
+        if state in ("stopped", "destroyed"):
+            raise SpawnFailed(
+                f"workload dead on spawn: {body.get('stopReason') or state}"
+            )
+        return body
 
     async def delete_workload(self, workload_id: str) -> None:
-        """Tear down a workload (``DELETE /workloads/{id}``) — the ROB3 partial-spawn compensation.
+        """Tear down a workload (``DELETE /workloads/{id}``) — teardown must be CONFIRMED.
 
-        Best-effort: a 404 (already gone) is fine, and any error is left for the caller to log; this
-        teardown must never mask the original post-spawn DB failure that triggered it."""
-        await self._client.delete(f"{self._url}/workloads/{workload_id}", timeout=30.0)
+        A 2xx means the kernel destroyed the workload (with kernel re-adoption that reaches the
+        real container even across a runtime restart). A 404 raises ``WorkloadUnknown``: the kernel
+        does not know the workload, so termination is UNCONFIRMED — a container may still be live
+        (the orphaned-live-bot incident treated exactly this 404 as success). Any other error
+        raises ``SpawnFailed``. Callers log loud and retry/backstop; they must never report a stop
+        as done on these."""
+        resp = await self._client.delete(
+            f"{self._url}/workloads/{workload_id}",
+            timeout=60.0,  # the kernel's graceful teardown can hold the request for its stop grace
+        )
+        if resp.status_code == 404:
+            raise WorkloadUnknown(workload_id)
+        if resp.status_code >= 400:
+            raise SpawnFailed(f"runtime kernel delete_workload returned {resp.status_code}")
 
     async def get_workload(self, workload_id: str) -> Optional[dict]:
-        """Liveness probe (``GET /workloads/{id}``). 404 → the kernel no longer tracks the workload
-        (the bot is GONE) → ``None``. Any other non-200 raises (treated by the caller as 'unknown,
-        do not reap' — fail safe toward NOT killing a possibly-live meeting)."""
+        """Liveness probe (``GET /workloads/{id}``). 404 → the kernel does not TRACK the workload →
+        ``None`` — which is NOT evidence the bot is gone (a recreated runtime forgets live bots);
+        the reconcile sweep treats it as 'untracked: fail loud, do not reap'. Any other non-200
+        raises (caller treats it as 'unknown, do not reap' — fail safe toward NOT killing a
+        possibly-live meeting)."""
         resp = await self._client.get(f"{self._url}/workloads/{workload_id}", timeout=10.0)
         if resp.status_code == 404:
             return None
@@ -456,8 +661,9 @@ class HttpRuntimeClient:
 def build_production_router(*, database_url: Optional[str] = None, runtime_api_url: Optional[str] = None):
     """Construct the bot-spawn router with real SQLAlchemy + httpx runtime adapters from env."""
     import httpx
-    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from sqlalchemy.ext.asyncio import async_sessionmaker
 
+    from ..db import build_engine
     from .router import build_router
 
     database_url = database_url or os.getenv(
@@ -465,7 +671,7 @@ def build_production_router(*, database_url: Optional[str] = None, runtime_api_u
     )
     runtime_api_url = runtime_api_url or os.getenv("RUNTIME_API_URL", "http://runtime:8090")
 
-    engine = create_async_engine(database_url, pool_pre_ping=True)
+    engine = build_engine(database_url)  # #635: env-steered pool
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     http = httpx.AsyncClient(timeout=30.0)
     return build_router(SqlAlchemyMeetingRepo(session_factory), HttpRuntimeClient(http, runtime_api_url))

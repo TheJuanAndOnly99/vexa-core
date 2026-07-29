@@ -186,6 +186,44 @@ def test_invalid_scope_422(client):
     assert "Invalid scope" in r.json()["detail"]
 
 
+def test_mint_scopes_from_json_body(client):
+    """#922: body ``{"scopes":["bot","tx"]}`` must be honored — not silently dropped to ["bot"]."""
+    user_id = client.post("/admin/users", headers=_admin(),
+                          json={"email": "body-scopes@vexa.ai"}).json()["id"]
+    r = client.post(
+        f"/admin/users/{user_id}/tokens",
+        headers=_admin(),
+        json={"scopes": ["bot", "tx"]},
+    )
+    assert r.status_code == 201, r.text
+    assert set(r.json()["scopes"]) == {"bot", "tx"}
+
+
+def test_mint_unknown_body_field_422(client):
+    """#922: an unsupported body field is refused (422), never silently dropped."""
+    user_id = client.post("/admin/users", headers=_admin(),
+                          json={"email": "body-extra@vexa.ai"}).json()["id"]
+    r = client.post(
+        f"/admin/users/{user_id}/tokens",
+        headers=_admin(),
+        json={"scopes": ["bot"], "not_a_field": True},
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_mint_body_scopes_win_over_query(client):
+    """When both body and query supply scopes, the body wins."""
+    user_id = client.post("/admin/users", headers=_admin(),
+                          json={"email": "body-wins@vexa.ai"}).json()["id"]
+    r = client.post(
+        f"/admin/users/{user_id}/tokens?scopes=bot",
+        headers=_admin(),
+        json={"scopes": ["bot", "tx"]},
+    )
+    assert r.status_code == 201, r.text
+    assert set(r.json()["scopes"]) == {"bot", "tx"}
+
+
 def test_admin_tier_auth_enforced(client):
     """The admin tier rejects a missing/wrong X-Admin-API-Key (403)."""
     r = client.post("/admin/users", json={"email": "f@vexa.ai"})           # no key
@@ -216,3 +254,47 @@ def test_list_user_tokens_scoped_and_secret_free(client):
 
     assert client.get("/admin/users/999999/tokens", headers=_admin()).status_code == 404
     assert client.get(f"/admin/users/{alice['id']}/tokens").status_code == 403  # admin tier required
+
+
+def _internal(h=None):
+    return {"X-Internal-Secret": INTERNAL_SECRET, **(h or {})}
+
+
+def test_membership_index_upsert_list_remove(client):
+    """Lane M internal edge: the users.data.memberships[] index mirror — upsert (idempotent per ws),
+    list, remove. This is the derived listing cache the agent-api writes alongside the authoritative
+    policy/members.json in the workspace git repo."""
+    r = client.post("/admin/users", headers=_admin(),
+                    json={"email": "mem@vexa.ai", "name": "Mem"})
+    assert r.status_code in (200, 201), r.text
+    uid = r.json()["id"]
+
+    # empty to start
+    assert client.get(f"/internal/users/{uid}/memberships", headers=_internal()).json()["memberships"] == []
+
+    # upsert two workspaces
+    client.post(f"/internal/users/{uid}/memberships", headers=_internal(),
+                json={"workspace_id": "wsA", "role": "viewer", "added_at": "2026-07-05T00:00:00Z"})
+    client.post(f"/internal/users/{uid}/memberships", headers=_internal(),
+                json={"workspace_id": "wsB", "role": "contributor", "added_at": "2026-07-05T00:00:00Z"})
+    got = client.get(f"/internal/users/{uid}/memberships", headers=_internal()).json()["memberships"]
+    assert {m["workspace_id"]: m["role"] for m in got} == {"wsA": "viewer", "wsB": "contributor"}
+
+    # idempotent per ws: re-upsert wsA with a flipped role updates in place (no dup)
+    client.post(f"/internal/users/{uid}/memberships", headers=_internal(),
+                json={"workspace_id": "wsA", "role": "contributor", "added_at": "2026-07-05T00:00:00Z"})
+    got = client.get(f"/internal/users/{uid}/memberships", headers=_internal()).json()["memberships"]
+    assert len(got) == 2 and {m["workspace_id"]: m["role"] for m in got}["wsA"] == "contributor"
+
+    # remove wsA
+    assert client.delete(f"/internal/users/{uid}/memberships/wsA", headers=_internal()).status_code == 200
+    got = client.get(f"/internal/users/{uid}/memberships", headers=_internal()).json()["memberships"]
+    assert [m["workspace_id"] for m in got] == ["wsB"]
+
+
+def test_membership_index_rejects_bad_internal_secret(client):
+    r = client.post("/admin/users", headers=_admin(), json={"email": "sec@vexa.ai", "name": "S"})
+    uid = r.json()["id"]
+    # wrong secret → 403
+    bad = client.get(f"/internal/users/{uid}/memberships", headers={"X-Internal-Secret": "nope"})
+    assert bad.status_code == 403

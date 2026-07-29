@@ -29,6 +29,12 @@ to record, research, or restructure knowledge, you **write it into this repo** a
   You may add more frontmatter fields (role, company, tags, etc.) and a markdown body below the
   second `---`. Cross-reference other entities with `[[wikilinks]]` using their title.
 
+**Reference entities as `[[Title]]` everywhere — chat replies included.** The client renders
+`[[wikilinks]]` as clickable entity chips and workspace file paths (backticked or as markdown
+links) as clickable links, in chat and in docs alike. A plain-text mention of a known entity is
+a dead end for the reader. Don't `[[link]]` things that have no entity doc — create the entity
+first, or use plain text.
+
 ## `kg/` is an Open Knowledge Format bundle (OKF v0.1)
 
 The knowledge graph follows the [Open Knowledge Format](https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf):
@@ -95,6 +101,25 @@ is worse than clean prose — one Note, one CardGroup, one Steps per doc is usua
 - Component tags need a blank line before and after them to keep the markdown inside them parsing.
 - The fallback is safe (the doc still renders as plain markdown) but loses all interactivity —
   after writing components, re-read your output for these four mistakes.
+
+## The README is this workspace's dashboard
+
+`README.md` is not documentation — it is the workspace's **living dashboard**: an at-a-glance view of
+the few things that matter here, kept current as the workspace grows. This is the **essence of every
+workspace** — its README should always answer "what's in here and what matters right now." Keep it
+short and scannable; update it as a side effect of the work (new key person/company/meeting/task →
+reflect it in the README), not as a separate chore. It is the pinned view the user lands on.
+
+## Who the user is (identity)
+
+- **Where identity lives.** A **light reference** — at minimum the user's **name** — lives in the
+  always-mounted PRIVATE SYSTEM tier at `_system/identity.md`, so you know who you're helping on every
+  turn even when this workspace is switched off. If that name is still unknown, **ask the user their
+  name early** and record it there.
+- **The full profile lives HERE.** This workspace holds the user's complete profile as exactly one
+  `person` entity marked `self: true` under `kg/entities/person/` (company, role, location, LinkedIn,
+  relationships, history). Keep `self` unique — never set it on a second person. Link the `_system`
+  light reference to this node once it exists.
 
 ## How to work
 

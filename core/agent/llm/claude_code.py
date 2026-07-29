@@ -19,8 +19,8 @@ import subprocess
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
-from llm.errors import preflight_provider_guard
-from llm.ports import HarnessExec, scrubbed_git_env
+from llm.errors import looks_like_auth_failure, preflight_provider_guard
+from llm.ports import HarnessExec, harness_subprocess_env
 
 
 def _short(content: object, n: int = 80) -> str:
@@ -82,12 +82,25 @@ def parse_stream_json(lines: Iterable[str]) -> Iterator[dict]:
                         "summary": _short(block.get("content")),
                     }
         elif t == "result":
-            yield {
+            reply = obj.get("result", "")
+            done = {
                 "type": "done",
-                "reply": obj.get("result", ""),
+                "reply": reply,
                 "sessionId": obj.get("session_id"),
                 "ok": obj.get("is_error") is not True and obj.get("subtype") != "error",
             }
+            if not done["ok"] and looks_like_auth_failure(reply):
+                # The CLI's own auth text ("Not logged in · Please run /login") is an internal of
+                # THIS adapter — /login doesn't exist for an API consumer. Rewrite to the
+                # platform-actionable message; the raw text rides along in `detail` (additive).
+                done["detail"] = _short(reply, 200)
+                done["reply"] = (
+                    "Model credentials are missing or expired for this deployment. "
+                    "Set or refresh one of HOST_CLAUDE_CREDENTIALS, ANTHROPIC_API_KEY, "
+                    "ANTHROPIC_AUTH_TOKEN, CLAUDE_CODE_OAUTH_TOKEN or VEXA_LLM_API_KEY, "
+                    "or configure a model under Settings → Models."
+                )
+            yield done
 
 
 def build_argv(
@@ -121,10 +134,13 @@ def build_argv(
 
 
 def _exec_subprocess(argv: list[str], cwd: str) -> Iterator[str]:
-    # scrubbed_git_env: the harness runs git inside the workspace; a hook-exported GIT_DIR would
-    # re-point those ops (and the workspace's own repo discovery) at the hook's repo.
+    # harness_subprocess_env: the model's Bash tool runs INSIDE this subprocess, so it must not inherit
+    # the worker's data-plane secrets — ``REDIS_URL`` (which would let Bash reach the shared redis and
+    # read/write another tenant's tc:meeting:* / unit:*:in streams, crossing the tenancy boundary the
+    # mounts enforce on the filesystem) nor the minted per-dispatch bearer token. It also drops the
+    # git repo-discovery redirects (a hook-exported GIT_DIR would re-point the workspace's git ops).
     proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-                            env=scrubbed_git_env())
+                            env=harness_subprocess_env())
     assert proc.stdout is not None
     try:
         yield from proc.stdout
@@ -205,9 +221,11 @@ class ClaudeCodeHarness:
                           mcp_config=mcp_config)
         yield from parse_stream_json(self._exec(argv, str(work)))
 
-    def prepare(self, work: Path) -> None:
-        # chats are saved to / resumed from the workspace, not ~/.claude; skills/ → .claude/skills
-        _link_chat_into_workspace(work)
+    def prepare(self, work: Path, chat_root: Optional[Path] = None) -> None:
+        # chats are saved to / resumed from the PRIVATE continuity root (the _system mount when the
+        # dispatch declares one — the flat model can make the cwd a SHARED workspace, and chats are
+        # private), not ~/.claude; skills stay cwd-scoped (.claude/skills → <work>/skills)
+        _link_chat_into_workspace(chat_root or work)
         _link_skills_into_workspace(work)
 
     def transcript_bytes(self, work: Path, session_id: str) -> int:

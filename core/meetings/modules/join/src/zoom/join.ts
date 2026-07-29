@@ -1,3 +1,4 @@
+import { AdmissionError } from '../shared/admission';
 import { Page } from "playwright";
 import { log, callJoiningCallback } from "../_host";
 import { BotConfig } from "../_host";
@@ -137,7 +138,10 @@ export async function joinZoomMeeting(
     }).catch(() => false);
     if (authRequired && !authenticated) {
       log('[Zoom Web] Sign-in page detected — meeting requires authenticated users');
-      throw new Error('[Zoom Web] auth_required: meeting host has restricted entry to authenticated Zoom users; bot cannot join without a Zoom account session');
+      // PERMANENT: the host restricted entry to signed-in users and this bot has no session — a
+      // re-spawn joins just as signed-out. Same sealed outcome the authenticated-mode dead-profile
+      // path uses; the retry classifier already treats it as no-retry.
+      throw new AdmissionError('auth_session_missing', '[Zoom Web] auth_required: meeting host has restricted entry to authenticated Zoom users; bot cannot join without a Zoom account session');
     }
     if (authRequired && authenticated) {
       log('[Zoom Web] Authenticated mode: sign-in text present, proceeding (the persistent context should already carry a Zoom session)');
@@ -246,7 +250,7 @@ export async function joinZoomMeeting(
   const passcodeInputSelector = 'input[placeholder*="passcode" i], input[placeholder*="password" i], input[type="password"]';
   const hasPasscodeField = await page.locator(passcodeInputSelector).first().isVisible({ timeout: 1000 }).catch(() => false);
   if (hasPasscodeField) {
-    const passcode = (botConfig as any).passcode || '';
+    const passcode = botConfig.passcode || '';
     if (passcode) {
       await page.locator(passcodeInputSelector).first().fill(passcode);
       log(`[Zoom Web] Filled passcode field`);

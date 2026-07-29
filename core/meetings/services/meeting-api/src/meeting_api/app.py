@@ -26,6 +26,9 @@ the conformance harness — the conformance assertions therefore drive THIS ship
 """
 from __future__ import annotations
 
+import asyncio
+import time
+from collections import deque
 from typing import Optional
 
 from fastapi import FastAPI, Request
@@ -37,6 +40,113 @@ from .collector.app import build_router as _build_collector_router
 from .collector.ports import RedisBus, TranscriptStore
 from .lifecycle.machine import LifecycleSink, MeetingStore
 from .obs import TraceMiddleware
+
+#: In-process capture of the last N emitted webhook envelopes — an eval/introspection seam, never a
+#: durable store (the DB meeting row is the durable record; the WebhookSink is the delivery path).
+#: BOUNDED because it lives on the production app and every bot lifecycle callback appends one
+#: envelope that embeds the meeting's ``data`` projection; an unbounded list grew RSS monotonically
+#: under production callback traffic while idle staging (no callbacks) stayed flat (#803). A ring
+#: buffer keeps the recent-envelope semantics every reader relies on (``[-1]``, ``len``, iteration)
+#: while capping retention.
+_ENVELOPE_LOG_CAP = 256
+
+
+def _xpending_total(summary) -> "Optional[int]":
+    """Total DELIVERED-but-un-acked count for the group from an XPENDING SUMMARY reply (#636).
+    redis-py returns a dict ``{'pending': N, 'min', 'max', 'consumers'}``; the raw protocol reply is
+    a list ``[N, min, max, consumers]``. Returns the integer total, or None when unrecognizable."""
+    if isinstance(summary, dict):
+        v = summary.get("pending")
+        return int(v) if isinstance(v, int) else None
+    if isinstance(summary, (list, tuple)) and summary:
+        try:
+            return int(summary[0])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+async def _pipeline_health(app) -> "tuple[dict, bool]":
+    """#527/#636: derive pipeline liveness from the per-loop heartbeats + collector-group lag +
+    pending-entry (PEL) depth, and decide whether to DEGRADE. A loop hung inside an await stops
+    stamping, so its tick_age_s climbs past PIPELINE_TICK_STALE_S even while the process and the
+    live-WS path look healthy — the 2026-04-26 silent hang. A crashed replica's delivered-but-un-acked
+    batch is NOT lag (it was delivered) and NOT a stale heartbeat on the survivor, so #636 surfaces it
+    as ``pending_depth``. Returns ``({loops, redis_reachable, consumer_lag, pending_depth}, degraded)``.
+
+    #809 — Redis is a CACHE/QUEUE dependency, not the process's spine: an unreachable Redis is
+    reported HONESTLY as ``redis_reachable: false`` but NEVER flips ``degraded`` (so it cannot 503 the
+    shared probe). DB-backed reads keep serving through a Redis outage, so readiness stays true — a
+    cache blip no longer becomes a total core outage (the 2026-07-19 boot-block/CrashLoop).
+
+    The probe MUST NOT itself hang (that would defeat the point): the XINFO/XPENDING calls are each
+    bounded by a 2s wait_for and any failure degrades that field to ``"unavailable"`` — never blocks."""
+    st = app.state
+    now = time.monotonic()
+    stale_s = getattr(st, "pipeline_tick_stale_s", 120.0)
+    lag_alarm = getattr(st, "pipeline_lag_alarm", 500)
+    pending_alarm = getattr(st, "pipeline_pending_alarm", 100)
+    loops = {name: round(now - ts, 1) for name, ts in (st.pipeline_ticks or {}).items()}
+    degraded = any(age > stale_s for age in loops.values())
+
+    lag = None
+    pending_depth = None
+    redis_reachable = None
+    redis = getattr(st, "pipeline_redis", None)
+    if redis is not None:
+        # #809: a bounded reachability PING FIRST — the honest per-component signal the 2026-07-19
+        # incident lacked (/health read "ok" through a 40-minute Redis outage). A dead Redis fails
+        # here within 2s; we then SKIP the stream probes (they would only time out too) and report
+        # their fields "unavailable". This NEVER sets `degraded`: Redis is a cache/queue, so the
+        # DB-backed readiness paths stay green and the shared probe stays 200 (no CrashLoop recurrence).
+        # `ping` is resolved defensively: a client without it (a minimal probe stub) leaves
+        # reachability UNKNOWN (None) and the stream probes run exactly as before — the real
+        # ``redis.asyncio`` client always has ``ping``, so production always gets the honest signal.
+        ping = getattr(redis, "ping", None)
+        if ping is not None:
+            try:
+                await asyncio.wait_for(ping(), timeout=2.0)
+                redis_reachable = True
+            except Exception:
+                redis_reachable = False
+    # Run the stream probes unless we KNOW Redis is down (reachable is False). Unknown (None, no
+    # ping) or True → probe, preserving the pre-#809 lag/pending behaviour.
+    if redis is not None and redis_reachable is not False:
+        try:
+            groups = await asyncio.wait_for(redis.xinfo_groups(st.pipeline_stream), timeout=2.0)
+            for g in groups or []:
+                name = g.get("name") if isinstance(g, dict) else None
+                name = name.decode() if isinstance(name, (bytes, bytearray)) else name
+                if name == st.pipeline_group:
+                    lag = g.get("lag")
+                    break
+        except Exception:
+            lag = "unavailable"  # a dead/absent group is itself a signal, never a hang
+        # #636: PEL depth — a bounded XPENDING SUMMARY. A delivered-but-un-acked orphan is invisible
+        # to lag; a SUSTAINED non-zero total is the orphan signal (steady state acks within a tick).
+        try:
+            summary = await asyncio.wait_for(
+                redis.xpending(st.pipeline_stream, st.pipeline_group), timeout=2.0
+            )
+            pending_depth = _xpending_total(summary)
+            if pending_depth is None:
+                pending_depth = "unavailable"
+        except Exception:
+            pending_depth = "unavailable"  # never block the probe on a pending read
+    elif redis is not None and redis_reachable is False:
+        # #809: Redis unreachable → the stream signals are unavailable, but readiness is NOT degraded.
+        lag = "unavailable"
+        pending_depth = "unavailable"
+    if isinstance(lag, int) and lag > lag_alarm:
+        degraded = True
+    if isinstance(pending_depth, int) and pending_depth > pending_alarm:
+        degraded = True
+    return {
+        "loops": loops,
+        "redis_reachable": redis_reachable,
+        "consumer_lag": lag,
+        "pending_depth": pending_depth,
+    }, degraded
 
 
 def create_app(
@@ -57,6 +167,18 @@ def create_app(
     command_publisher: Optional["object"] = None,
     # per-user webhook delivery sink (WebhookSink) — delivers meeting.status_change on each FSM advance
     webhook_sink: Optional["object"] = None,
+    # per-user delivery ledger (#841) — the queryable record GET /webhooks/deliveries reads. The
+    # lifecycle callback records each delivery outcome here so the dashboard's Delivery History
+    # reflects real deliveries, not just the Test button. None → in-memory fake (app-factory/tests).
+    delivery_ledger: Optional["object"] = None,
+    # completion finalizer — awaited with the NUMERIC meeting id when the FSM lands on a TERMINAL
+    # status (completed/failed). Production wires collector/db_writer.finalize_meeting: flush the
+    # meeting's remaining redis segments to Postgres + persist the processed doc into meeting.data,
+    # so a finished meeting's transcript is durable IMMEDIATELY. Best-effort — never fails the callback.
+    transcript_finalizer: Optional["object"] = None,
+    # calendar-sync user edges (async callables from the composition root; None → routes 503)
+    calendar_sync_now: Optional["object"] = None,
+    calendar_sync_status: Optional["object"] = None,
 ) -> FastAPI:
     """Build the unified meeting-api app from the injected ports.
 
@@ -69,10 +191,27 @@ def create_app(
     # The edge: read/mint X-Trace-Id and bind it for the request (logevent.v1 trace_id).
     app.add_middleware(TraceMiddleware)
 
-    # --- shared liveness probe (gate:health): the unified process is up. No auth, no I/O. ---
+    # --- shared liveness probe (gate:health): the unified process is up. No auth. The ADDITIVE
+    # `capabilities` rows are the config.v1 tri-states (stt · object_storage) incl. the cached STT
+    # live auth probe (ADR-0026) — existing consumers key on `status` only and keep working; the
+    # rows never flip `status` (an unconfigured capability degrades a FEATURE, not the process). ---
     @app.get("/health")
     async def health():
-        return {"status": "ok", "service": "meeting-api"}
+        from .config_preflight import capability_health
+
+        body = {"status": "ok", "service": "meeting-api", "capabilities": capability_health()}
+        # #527: additive `pipeline` section — present ONLY when the background loops are wired
+        # (build_production_app sets app.state.pipeline_ticks). On the bare app-factory path (unit
+        # tests, conformance) the section is omitted and status stays "ok" — existing /health
+        # consumers are unchanged. A stale loop or a lag over threshold flips status→degraded + 503,
+        # so a dead pipeline that keeps the live-WS path flowing no longer looks healthy.
+        if getattr(app.state, "pipeline_ticks", None) is not None:
+            pipeline, degraded = await _pipeline_health(app)
+            body["pipeline"] = pipeline
+            if degraded:
+                body["status"] = "degraded"
+                return JSONResponse(body, status_code=503)
+        return body
 
     # --- bot_spawn ports (resolved FIRST: the meeting_repo is also the lifecycle-persistence target) ---
     if meeting_repo is None:
@@ -85,9 +224,17 @@ def create_app(
     app.state.lifecycle_sink = sink
     app.state.lifecycle_store = sink.store
     app.state.webhook_sink = webhook_sink
+    # #841: the per-user delivery ledger the read endpoint serves. Default to the in-memory fake so
+    # the app-factory / conformance path stands up without redis (same pattern as the other ports).
+    if delivery_ledger is None:
+        from .webhooks import InMemoryDeliveryLedger
+
+        delivery_ledger = InMemoryDeliveryLedger()
+    app.state.delivery_ledger = delivery_ledger
     # The lifecycle callback publishes each persisted FSM advance to bm:meeting:{id}:status so the
     # gateway /ws (which SUBSCRIBEs that channel) forwards a ws.v1 BotStatus frame to the dashboard.
-    _mount_lifecycle(app, sink, meeting_repo, webhook_sink, redis)
+    _mount_lifecycle(app, sink, meeting_repo, webhook_sink, redis, transcript_finalizer,
+                     delivery_ledger)
 
     # --- bot_spawn: POST /bots (invocation.v1 + runtime.v1) ---
     app.include_router(_bot_spawn.build_router(meeting_repo, runtime))
@@ -105,7 +252,9 @@ def create_app(
     # --- collector: transcripts + meetings + ws-authorize (api.v1) ---
     if transcript_store is None:
         transcript_store = _collector_fakes().InMemoryTranscriptStore()
-    app.include_router(_build_collector_router(transcript_store, redis))
+    app.include_router(_build_collector_router(transcript_store, redis,
+                                            calendar_sync_now=calendar_sync_now,
+                                            calendar_sync_status=calendar_sync_status))
 
     # --- recordings: chunk upload + finalize → meeting.data JSONB (recording.v1) ---
     if recording_repo is None:
@@ -114,10 +263,52 @@ def create_app(
         storage = _recordings_fakes().InMemoryStorage()
     app.include_router(_recordings.build_router(recording_repo, storage, token_secret=token_secret))
 
+    # --- webhooks: GET /webhooks/deliveries — the per-user delivery history the dashboard reads (#841) ---
+    app.include_router(_build_webhooks_router(delivery_ledger))
+
     return app
 
 
+# ── webhooks read surface (#841): the queryable delivery ledger the dashboard's history reads ────
+
+
+def _build_webhooks_router(delivery_ledger: "object") -> "object":
+    """``GET /webhooks/deliveries`` — the per-user webhook delivery history (#841).
+
+    Owner-scoped via ``X-User-Id`` (the gateway injects it from the resolved key; the client never
+    sets it). Returns ``{deliveries: [...]}`` newest-first — each row is the #817 outcome taxonomy
+    (host only, never a URL or secret; P14). This is the user-facing completion of #815→#817:
+    the dispatcher records every outcome here, so real deliveries appear in Delivery History, not
+    just the dashboard's own Test button.
+    """
+    from fastapi import APIRouter, Header, Query
+
+    router = APIRouter()
+
+    @router.get("/webhooks/deliveries")
+    async def list_deliveries(
+        x_user_id: Optional[str] = Header(default=None),
+        limit: int = Query(default=100, ge=1, le=500),
+    ):
+        user_id = x_user_id
+        deliveries = await delivery_ledger.list(user_id, limit=limit) if user_id else []
+        return {"deliveries": deliveries}
+
+    return router
+
+
 # ── lifecycle mount (the receiver's callback route, on the shared app) ───────────────────────────
+
+
+def _webhook_target_host(url: str) -> str:
+    """Host of a webhook URL, for the delivery log. Never the full URL: a subscriber's endpoint can
+    carry a token in its path or query, and an operator reading delivery outcomes does not need it."""
+    from urllib.parse import urlsplit
+
+    try:
+        return urlsplit(url).hostname or "?"
+    except Exception:  # noqa: BLE001 — a log field must never break delivery
+        return "?"
 
 
 def _mount_lifecycle(
@@ -126,6 +317,8 @@ def _mount_lifecycle(
     meeting_repo: "_bot_spawn.MeetingRepo",
     webhook_sink: "object" = None,
     redis: "object" = None,
+    transcript_finalizer: "object" = None,
+    delivery_ledger: "object" = None,
 ) -> None:
     """Register the lifecycle.v1 callback route on the unified app (the lifecycle receiver's
     ``/bots/internal/callback/lifecycle`` handler, sharing the app's TraceMiddleware).
@@ -174,12 +367,27 @@ def _mount_lifecycle(
             "updated_at": _iso(row.get("updated_at")),
         }
 
-    app.state.status_change_webhooks = []
-    app.state.typed_webhooks = []
+    app.state.status_change_webhooks = deque(maxlen=_ENVELOPE_LOG_CAP)
+    app.state.typed_webhooks = deque(maxlen=_ENVELOPE_LOG_CAP)
 
-    @app.post("/bots/internal/callback/lifecycle")
-    async def lifecycle_callback(request: Request) -> JSONResponse:
-        body = await request.json()
+    async def _apply_lifecycle_event(
+        body: dict,
+        *,
+        transition_source: "TransitionSource" = TransitionSource.BOT_CALLBACK,
+        force_terminal_on_destroy: bool = False,
+    ) -> tuple[int, dict]:
+        """Apply ONE lifecycle.v1 event to the FSM + run every side effect (persist, finalize,
+        webhook deliver, ws publish, copilot reap), returning ``(status_code, content)``.
+
+        This is the SINGLE in-process entry the FSM advance flows through — the HTTP endpoint
+        ``POST /bots/internal/callback/lifecycle`` (the bot's own callback) is a thin wrapper around
+        it, and the runtime-callback synthetic-terminal path calls it DIRECTLY (no HTTP self-POST).
+        The prior implementation POSTed to ``http://127.0.0.1:PORT/…`` to re-enter this logic; that
+        loopback round-trip was fragile (a rehydration race made the synthetic terminal 409, and
+        under any harness that cannot reach the loopback it silently dropped) — the direct in-process
+        call removes the network hop entirely, so the synthetic terminal advances the SAME FSM
+        instance deterministically. ``force_terminal_on_destroy`` rides through to the sink so a
+        runtime-confirmed destroy can force the terminal edge from a stale non-terminal state."""
         try:
             conforms(body, "LifecycleEvent")
         except jsonschema.ValidationError as e:
@@ -188,9 +396,9 @@ def _mount_lifecycle(
                 span="lifecycle.callback",
                 fields={"reason": "schema_violation", "detail": e.message},
             )
-            return JSONResponse(
-                status_code=422,
-                content={"status": "error", "detail": f"lifecycle.v1 schema violation: {e.message}"},
+            return (
+                422,
+                {"status": "error", "detail": f"lifecycle.v1 schema violation: {e.message}"},
             )
         # LIFECYCLE-409 fix: rehydrate the in-memory FSM record from the DB's CURRENT status before
         # applying the event. The in-memory MeetingStore is non-durable — after a meeting-api restart
@@ -212,11 +420,15 @@ def _mount_lifecycle(
                 if persisted:
                     sink.store.rehydrate(connection_id, persisted)
         try:
-            change = sink.apply_change(body, transition_source=TransitionSource.BOT_CALLBACK)
+            change = sink.apply_change(
+                body,
+                transition_source=transition_source,
+                force_terminal_on_destroy=force_terminal_on_destroy,
+            )
         except IllegalTransition as e:
-            return JSONResponse(
-                status_code=409,
-                content={
+            return (
+                409,
+                {
                     "status": "error", "detail": str(e),
                     "connection_id": e.connection_id,
                     "from": e.frm.value if e.frm is not None else None,
@@ -252,6 +464,27 @@ def _mount_lifecycle(
             except Exception as e:  # noqa: BLE001 — persistence is best-effort
                 log_event("lifecycle_persist_failed", audience="system", level="warning",
                           span="lifecycle.callback", fields={"error": str(e)})
+        # COMPLETION FINALIZATION — the moment the FSM lands on a terminal status, flush the
+        # meeting's remaining live redis segments to the durable store (threshold 0: the mutable
+        # tail included, no more updates are coming) and persist the processed doc into
+        # meeting.data, via the injected finalizer (prod: collector/db_writer.finalize_meeting).
+        # This guarantees a completed meeting's transcript is durable even if the periodic
+        # db-writer never gets another tick (crash/restart right after completion). Best-effort:
+        # the periodic loop retries anything this misses; never fail the bot's callback.
+        if (
+            transcript_finalizer is not None
+            and not change.no_op
+            and rec.status is not None
+            and rec.status.value in ("completed", "failed")
+            and isinstance(meeting_row, dict)
+            and meeting_row.get("id") is not None
+        ):
+            try:
+                await transcript_finalizer(meeting_row["id"])
+            except Exception as e:  # noqa: BLE001 — the db-writer loop is the retry path
+                log_event("transcript_finalize_failed", audience="system", level="warning",
+                          span="lifecycle.callback",
+                          fields={"meeting_id": meeting_row.get("id"), "error": str(e)})
         # Build the TYPED event the transition maps to (meeting.started on active,
         # meeting.completed with the post-meeting envelope on completion, bot.failed on terminal
         # failure) — additive alongside meeting.status_change, never instead of it. Built AFTER the
@@ -279,11 +512,57 @@ def _mount_lifecycle(
                     if env is None:
                         continue
                     try:
-                        await webhook_sink.deliver(
+                        result = await webhook_sink.deliver(
                             url, env, data.get("webhook_secret"),
                             events_config=data.get("webhook_events"),
                             label=f"meeting:{meeting_row.get('id')}",
                         )
+                        # EVERY outcome is reported (#815). `deliver` never raises — it returns
+                        # delivered | suppressed | blocked | failed | queued — and the outcome used
+                        # to be discarded, so a webhook the subscriber never received (unsubscribed
+                        # event type, SSRF-blocked target, 4xx endpoint) was indistinguishable from
+                        # one that arrived: "my webhooks stopped" was undiagnosable in production.
+                        # The target is reported as host only — a webhook URL can carry a secret in
+                        # its path or query, and logs are not a place to put one.
+                        log_event(
+                            "webhook_delivery",
+                            audience="system",
+                            level="info" if result.status == "delivered" else "warning",
+                            span="lifecycle.callback",
+                            meeting_id=meeting_row.get("id"),
+                            fields={
+                                "outcome": result.status,
+                                "event_type": env.get("event_type"),
+                                "target_host": _webhook_target_host(url),
+                                "status_code": result.status_code,
+                                "error": result.error,
+                            },
+                        )
+                        # #841: ALSO record the outcome in the per-user delivery ledger — the
+                        # queryable surface GET /webhooks/deliveries serves. Logs (above) rotate and
+                        # are operator-facing; the ledger is the user's Delivery History. Host only,
+                        # never the URL/secret (P14). Best-effort — a ledger hiccup never fails the
+                        # callback, and a suppressed event is still worth recording (the user asked
+                        # "why didn't my webhook fire?" — "suppressed: unsubscribed" is the answer).
+                        if delivery_ledger is not None:
+                            from .webhooks import build_delivery_record
+
+                            try:
+                                await delivery_ledger.record(
+                                    meeting_row.get("user_id"),
+                                    build_delivery_record(
+                                        event_type=env.get("event_type"),
+                                        event_id=env.get("event_id"),
+                                        target_host=_webhook_target_host(url),
+                                        outcome=result.status,
+                                        status_code=result.status_code,
+                                        meeting_id=meeting_row.get("id"),
+                                    ),
+                                )
+                            except Exception as le:  # noqa: BLE001 — ledger is best-effort
+                                log_event("webhook_ledger_failed", audience="system",
+                                          level="warning", span="lifecycle.callback",
+                                          fields={"error": str(le)})
                     except Exception as e:  # noqa: BLE001 — delivery is best-effort
                         log_event("webhook_deliver_failed", audience="system", level="warning",
                                   span="lifecycle.callback", fields={"error": str(e)})
@@ -336,14 +615,55 @@ def _mount_lifecycle(
                         log_event("user_meeting_status_publish_failed", audience="system",
                                   level="warning", span="lifecycle.callback",
                                   fields={"error": str(e)})
+        # COPILOT REAP (Bug 3): the moment a meeting lands TERMINAL, emit the `session_end` marker onto
+        # the meeting copilot transcript feed — the EXACT stream the meeting copilot worker
+        # (agent worker/meeting.py, via VEXA_TRANSCRIPT_STREAM) blocks on. The worker reaps immediately
+        # on that marker (exit 0 → container reaped), instead of sitting idle for its
+        # VEXA_IDLE_TIMEOUT_SEC (default 4h) when the bot never emitted its own `session_end` — e.g. it
+        # was SIGKILLed, or stopped in the waiting room (Bug 2) before it could. Idempotent: a redundant
+        # session_end (the bot already sent one via the collector) just reasserts the reap. Best-effort;
+        # never fails the lifecycle callback.
+        #
+        # KEYING (P0 fix/transcript-cross-tenant-leak, now merged): the carrier is ROW-scoped
+        # `tc:meeting:{meeting_row_id}` — the numeric meetings-domain ROW id, NOT the native id (which
+        # collides across tenants/rows and is never a data key post-P0). The collector
+        # (collector/ingest.py `_transcript_stream`) writes its session_end on the same row key and the
+        # worker tails the row key (agent dispatch.py sets VEXA_TRANSCRIPT_STREAM=tc:meeting:{row_id}),
+        # so this lifecycle reap must key by the row id to land on the live stream the worker blocks on.
+        if (
+            redis is not None
+            and not change.no_op
+            and rec.status is not None
+            and rec.status.value in ("completed", "failed")
+            and isinstance(meeting_row, dict)
+            and hasattr(redis, "xadd")
+        ):
+            meeting_row_id = meeting_row.get("id")
+            native = meeting_row.get("native_meeting_id") or rec.connection_id
+            if meeting_row_id is not None:
+                try:
+                    await redis.xadd(
+                        f"tc:meeting:{meeting_row_id}",
+                        {"type": "session_end", "uid": str(native or meeting_row_id)},
+                    )
+                    log_event(
+                        "meeting_copilot_reap_signalled", audience="system", span="lifecycle.callback",
+                        meeting_id=rec.connection_id,
+                        fields={"meeting_row_id": meeting_row_id, "native": native,
+                                "meeting_status": rec.status.value},
+                    )
+                except Exception as e:  # noqa: BLE001 — the worker's idle timeout is the backstop
+                    log_event("meeting_copilot_reap_failed", audience="system", level="warning",
+                              span="lifecycle.callback",
+                              fields={"meeting_row_id": meeting_row_id, "error": str(e)})
         log_event(
             "meeting_lifecycle_advanced", audience="user", span="lifecycle.callback",
             meeting_id=rec.connection_id,
             fields={"meeting_status": rec.status.value if rec.status else None},
         )
-        return JSONResponse(
-            status_code=200,
-            content={
+        return (
+            200,
+            {
                 "status": "accepted",
                 "connection_id": rec.connection_id,
                 "meeting_status": rec.status.value if rec.status else None,
@@ -355,13 +675,42 @@ def _mount_lifecycle(
             },
         )
 
+    # Expose the in-process entry so the runtime-callback synthetic-terminal path can advance the FSM
+    # DIRECTLY (no HTTP self-POST to 127.0.0.1:PORT). Same instance, same store, same side effects.
+    app.state.apply_lifecycle_event = _apply_lifecycle_event
+
+    @app.post("/bots/internal/callback/lifecycle")
+    async def lifecycle_callback(request: Request) -> JSONResponse:
+        body = await request.json()
+        status_code, content = await _apply_lifecycle_event(
+            body, transition_source=TransitionSource.BOT_CALLBACK
+        )
+        return JSONResponse(status_code=status_code, content=content)
+
     @app.post("/runtime/callback")
     async def runtime_callback(request: Request) -> JSONResponse:
         """ACK the runtime kernel's workload-level callback (state/terminal events). The bot's own
         ``lifecycle.v1`` callback is the meeting-status source of truth for a STARTED bot; this route
-        also drives a synthetic ``failed`` (CC5) when a workload reaches a TERMINAL state while its
-        meeting is still PRE-ACTIVE — i.e. the bot never started/reported and never will, so the meeting
-        would otherwise hang ``requested``/``joining`` forever."""
+        ALSO consumes a runtime-confirmed TERMINAL workload state as evidence the run is over, driving a
+        synthetic terminal through the SAME in-process lifecycle logic (no HTTP self-POST):
+
+          * PRE-ACTIVE meeting → ``failed`` (CC5): the bot never started/reported and never will, so the
+            meeting would otherwise hang ``requested``/``joining`` forever.
+          * WAS-ACTIVE meeting (``stopping``/``active``/``needs_help``) → ``completed``: the bot reached
+            the meeting but its workload is now runtime-confirmed gone WITHOUT its own terminal callback
+            (e.g. SIGKILLed at teardown before it could POST ``completed``, or killed in the waiting room
+            on a stop). Without this the meeting stays ``stopping`` and the stop-reconcile sweep re-DELETEs
+            (now 404) every 15s FOREVER — the reaper loop. The confirmed destroy IS the terminal evidence
+            (#50's principle: real evidence, not a bare 404) → complete it and stop the loop.
+
+        THE FIX (live 409): the synthetic terminal is applied by calling the in-process lifecycle entry
+        (``app.state.apply_lifecycle_event``) DIRECTLY with ``transition_source=RUNTIME_DESTROY`` and
+        ``force_terminal_on_destroy=True`` — NOT an httpx POST to ``127.0.0.1:PORT``. The old self-POST
+        409'd whenever the in-process FSM record was a stale non-terminal state the DB had already moved
+        past (e.g. store still ``joining`` while the DB user-stop set ``stopping`` — ``joining →
+        completed`` is illegal for a bot-driven edge). The direct in-process call advances the SAME FSM
+        instance, and the runtime-destroy source forces the terminal edge on real teardown evidence, so
+        the meeting reaches terminal, the reaper stops, and the copilot ``session_end`` reap fires."""
         try:
             body = await request.json()
         except Exception:  # noqa: BLE001
@@ -372,34 +721,32 @@ def _mount_lifecycle(
             "runtime_callback", audience="system", span="runtime.callback",
             fields={"workload_id": workload_id, "state": state},
         )
-        # CC5 — never-started workload → meeting failed. Reuse the bot's OWN lifecycle callback (POST to
-        # self) so the FSM/persist/webhook/ws path fires identically; the decision is best-effort + only
-        # fires for a PRE-ACTIVE meeting (a normal teardown destroys the workload AFTER the meeting is
-        # already terminal → no-op). Imported lazily to keep the prod import path lean.
+        # Consume a runtime-confirmed TERMINAL workload as evidence (pre-active → failed / was-active →
+        # completed). Drive it through the SAME in-process lifecycle logic (FSM/persist/webhook/ws/reap
+        # all fire identically) — best-effort; a non-terminal state or an already-terminal meeting is a
+        # no-op. Imported lazily to keep the prod import path lean.
         try:
             import logging as _logging
-            import os as _os
 
-            from .lifecycle.reconcile import synthesize_failed_for_dead_workload
+            from .lifecycle.machine import TransitionSource as _TS
+            from .lifecycle.reconcile import synthesize_terminal_for_dead_workload
 
-            async def _drive_failed(event: dict):
-                import httpx
+            async def _drive_terminal(event: dict):
+                # In-process — no network hop. The runtime-destroy source forces the terminal edge past
+                # a stale non-terminal FSM record; returns the HTTP-equivalent status code for the log.
+                status_code, _content = await _apply_lifecycle_event(
+                    event,
+                    transition_source=_TS.RUNTIME_DESTROY,
+                    force_terminal_on_destroy=True,
+                )
+                return status_code
 
-                port = int(_os.getenv("PORT", "8080"))
-                url = f"http://127.0.0.1:{port}/bots/internal/callback/lifecycle"
-                headers = {"content-type": "application/json"}
-                secret = _os.getenv("INTERNAL_API_SECRET")
-                if secret:
-                    headers["x-internal-secret"] = secret
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    return (await client.post(url, json=event, headers=headers)).status_code
-
-            await synthesize_failed_for_dead_workload(
-                meeting_repo, workload_id, state, _drive_failed,
+            await synthesize_terminal_for_dead_workload(
+                meeting_repo, workload_id, state, _drive_terminal,
                 log=_logging.getLogger("meeting_api.runtime.callback"),
             )
-        except Exception as e:  # noqa: BLE001 — the runtime ACK must never fail on the CC5 backstop
-            log_event("runtime_callback_cc5_error", audience="system", level="warning",
+        except Exception as e:  # noqa: BLE001 — the runtime ACK must never fail on the terminal backstop
+            log_event("runtime_callback_terminal_error", audience="system", level="warning",
                       span="runtime.callback", fields={"error": str(e)})
         return JSONResponse(status_code=200, content={"status": "accepted"})
 

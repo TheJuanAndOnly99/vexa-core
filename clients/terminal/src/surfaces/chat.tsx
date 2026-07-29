@@ -12,17 +12,24 @@ import { Icon } from "../ui-kit";
 import { startStreamingDictation, type StreamingDictation } from "../ui-kit/micDictation";
 import { sessionTitle, type SessionSummary } from "./sessions";
 import { listSessions } from "./sessionsApi";
+import { streamChatTurn, type ChatPhase } from "./chatStream";
+import { buildChatContext, focusTarget, readIncludeSchedule, scheduleEligible, writeIncludeSchedule, type FocusPayload } from "./chatContext";
 import { useLiveMeetings } from "./liveMeetings";
-import { type MeetingMock } from "./meetingModel";
+import { meetingPhase, type MeetingMock, type MeetingPhase } from "./meetingModel";
 import { ASK_CHAT_EVENT, ONBOARDING_KICKOFF_MARK, ONBOARDING_SEED_EVENT, ONBOARDING_GREETING, ONBOARDING_GROUNDING, ONBOARDING_REPLY_SEP } from "../canvas/actions";
 
 /** classify a tool name into one of the op icons so the operation line reads at a glance */
 function toolOp(tool: string): Op {
   const t = tool.toLowerCase();
-  const icon = /read|cat|open/.test(t) ? opIcon.read : /search|grep|find/.test(t) ? opIcon.search
-    : /edit|write|append/.test(t) ? opIcon.edit : /git|commit/.test(t) ? opIcon.git
-    : /web|fetch|http/.test(t) ? opIcon.web : opIcon.tool;
-  return { icon, label: tool, status: "done" };
+  // verb-first labels: the op line reads as what the agent is DOING, not an internal tool name
+  const [icon, verb] = /read|cat|open/.test(t) ? [opIcon.read, "Reading"]
+    : /glob|search|grep|find|ls\b/.test(t) ? [opIcon.search, "Searching"]
+    : /edit|write|append/.test(t) ? [opIcon.edit, "Writing"]
+    : /git|commit/.test(t) ? [opIcon.git, "Committing"]
+    : /web|fetch|http/.test(t) ? [opIcon.web, "Browsing"]
+    : /bash|exec|run/.test(t) ? [opIcon.tool, "Running"]
+    : [opIcon.tool, tool];
+  return { icon, label: verb === tool ? tool : `${verb} · ${tool}`, status: "done" };
 }
 
 /** the backend history turn shape (GET /api/sessions/:session/history) */
@@ -87,8 +94,9 @@ function patchAgentTurn(key: string, agentId: string, fn: (turn: AgentTurn) => A
 }
 
 /** map a backend op label (read/search/edit/git/web/tool) to a frontend Op (icon from opIcon) */
+const OP_VERB: Record<string, string> = { read: "Reading", search: "Searching", edit: "Writing", git: "Committing", web: "Browsing", tool: "Working" };
 function historyOp(op: { label: string }): Op {
-  return { icon: opIcon[op.label] ?? opIcon.tool, label: op.label, status: "done" };
+  return { icon: opIcon[op.label] ?? opIcon.tool, label: OP_VERB[op.label] ?? op.label, status: "done" };
 }
 
 type ReferenceToken = { kind: "file" | "meeting"; value: string; raw: string };
@@ -175,8 +183,50 @@ function meetingTokenFromTitle(title: string): ReferenceToken {
   return { kind: "meeting", value, raw: `@meeting:${value}` };
 }
 
+// Server-side grounding preambles (kg-links, mount stack, meeting phase, schedule digest,
+// workspace focus) are PART of the stored prompt — plumbing, not something the user typed.
+// Each known block is stripped start→terminator so history shows only the user's words
+// (fail-soft: an unrecognized shape renders untouched). Mirrors worker/engine.py + meeting_steering.py.
+const CONTEXT_BLOCKS: Array<[RegExp, RegExp]> = [
+  [/^## Referencing knowledge \(always\)/, /or use plain text\.\s*/],
+  [/^## Your mounted workspaces/, /do not guess or invent mount paths\.\s*/],
+  [/^<schedule[ >]/, /<\/schedule>\s*/],   // the digest opens with attributes (tz/now) — match them
+  [/^The user's meeting schedule is in <schedule>/, /notes files or ask\.\s*/],
+  [/^You are assisting in a live meeting/, /(?:<\/transcript>\s*|no transcript yet\.\s*)/],
+  // the prep steering grew (proactive-research + example-entities + identity clauses); anchor on its
+  // CURRENT tail. ("don't have prior context." now appears mid-block, so it can't be the terminator.)
+  [/^You are helping the user PREPARE/, /starting blank\.\s*/],
+  [/^The meeting "/, /(?:<\/transcript>\s*|invent its content\.\s*)/],
+  [/^The user is looking at the workspace/, /(?:<\/readme>\s*|context is missing\.\s*)/],
+];
+
+// The server marks the grounding→user boundary with this sentinel (control_plane/api.py). When present,
+// ONE cut removes every folded block regardless of wording drift; the regex blocks below are the
+// fallback for chats stored before the sentinel shipped.
+const CONTEXT_SENTINEL = "<!--vexa:user-input-below-->";
+
+export function stripContextBlocks(raw: string): string {
+  const si = raw.lastIndexOf(CONTEXT_SENTINEL);
+  if (si >= 0) {
+    const after = raw.slice(si + CONTEXT_SENTINEL.length).trimStart();
+    if (after) return after;   // everything up to & including the sentinel is server grounding
+  }
+  let text = raw;
+  let guard = 0;
+  outer: while (guard++ < 12) {
+    for (const [start, end] of CONTEXT_BLOCKS) {
+      if (start.test(text)) {
+        const m = end.exec(text);
+        if (m) { text = text.slice(m.index + m[0].length).trimStart(); continue outer; }
+      }
+    }
+    break;
+  }
+  return text === raw ? raw : (text.trim() || raw);
+}
+
 function compactStoredUserText(text: string): string {
-  const raw = text.trim();
+  const raw = stripContextBlocks(text.trim());
   // An onboarding first reply is stored as `<grounding>[reply]<user text>` — show only the user's text.
   if (raw.includes(ONBOARDING_KICKOFF_MARK)) {
     const i = raw.indexOf(ONBOARDING_REPLY_SEP);
@@ -198,7 +248,9 @@ function compactStoredUserText(text: string): string {
   if (activeFile) {
     return appendReferenceToken(activeFile[2], { kind: "file", value: activeFile[1], raw: `@file:${activeFile[1]}` });
   }
-  return text;
+  // The default is the CONTEXT-STRIPPED text (sentinel/regex) — NOT the raw stored prompt. Returning
+  // `text` here silently discarded the strip, leaking the whole grounding preamble into the bubble.
+  return raw;
 }
 
 const userBubble: CSSProperties = { maxWidth: "82%", margin: "0 0 0 auto", background: "var(--panel2)", border: "1px solid var(--line)", borderRadius: 12, borderTopRightRadius: 4, padding: "8px 12px", fontSize: 13, color: "var(--t1)", lineHeight: 1.5, whiteSpace: "pre-wrap" };
@@ -284,7 +336,7 @@ function ChatHeader({ subject, session, onSelectSession, onNewChat, onClose }: {
 
       {open && (
         <div role="menu" style={{ position: "absolute", zIndex: 30, top: 36, left: 8, right: 8, maxHeight: 260, overflowY: "auto", border: "1px solid var(--line)", borderRadius: 8, background: "var(--panel)", boxShadow: "0 14px 34px rgba(0,0,0,.32)", padding: 4 }}>
-          {error && <div role="alert" style={{ padding: "8px", color: "var(--danger, #e5484d)", fontSize: 12 }}>⚠ Couldn&apos;t load sessions — {error}</div>}
+          {error && <div role="alert" style={{ padding: "8px", color: "var(--danger)", fontSize: 12 }}>⚠ Couldn&apos;t load sessions — {error}</div>}
           {visibleSessions.map((s) => {
             const active = s.session === session;
             return (
@@ -390,9 +442,23 @@ function activeReference(tab: ActiveTab | null): ActiveReference | null {
   const path = typeof tab.params.path === "string" ? tab.params.path : null;
   if ((tab.kind === "doc" || tab.kind === "file") && path) return { kind: "file", value: path, raw: `@file:${path}` };
   const meetingId = typeof tab.params.meetingId === "string" ? tab.params.meetingId : null;
-  if (tab.kind === "meeting" && meetingId) return { kind: "meeting", value: meetingId, raw: `@meeting:${meetingId}` };
+  // A PREP tab focuses its meeting too — the chat enters "Preparing" mode for it (W3/W4).
+  if ((tab.kind === "meeting" || tab.kind === "meetingPrep") && meetingId) return { kind: "meeting", value: meetingId, raw: `@meeting:${meetingId}` };
   return null;
 }
+
+// ── chat MODE (design-spec meeting-lifecycle-v2, W3): the composer states its meeting phase ────────
+const MODE_CHIP: Record<MeetingPhase, { label: string; color: string; bg: string }> = {
+  prep: { label: "Preparing", color: "var(--accent)", bg: "var(--accentbg)" },
+  live: { label: "In meeting", color: "var(--green)", bg: "var(--greenbg)" },
+  post: { label: "Recap", color: "var(--violet)", bg: "var(--violetbg)" },
+};
+const MODE_PLACEHOLDER: Record<MeetingPhase, string> = {
+  prep: "Ask me to build the agenda, research attendees, or draft the brief…",
+  live: "Ask about what's being said…",
+  post: "Ask for the recap, decisions, or follow-up drafts…",
+};
+const meetingLabel = (m: MeetingMock) => m.title_custom ?? (m.native_id ?? m.title).replace(/^Google Meet · /, "");
 
 function activeContextPrompt(ref: ActiveReference | null, meeting: MeetingMock | undefined): string {
   if (!ref) return "";
@@ -477,7 +543,7 @@ export function Chat({ params = {} }: ChatProps) {
   const subject = typeof params.subject === "string" ? params.subject : "me";  // LOCAL chat-cache key only — never sent upstream; scope is server-derived from the authed user (P20)
   const commands = useService(CommandServiceId);
   const layout = useService(LayoutServiceId);
-  const { activeTab, activeSession } = useStore(layout.store);
+  const { activeTab, activeSession, activeList } = useStore(layout.store);
   // the rail follows the store's active session (switched from the rail header or Sessions list); params override if ever passed.
   const session = typeof params.session === "string" && params.session.trim() ? params.session : activeSession;
   const chatKey = chatStateKey(subject, session);
@@ -491,6 +557,14 @@ export function Chat({ params = {} }: ChatProps) {
   // the user can clear focus with the chip's ×; a newly-focused tab re-shows it.
   const [focusCleared, setFocusCleared] = useState(false);
   useEffect(() => { setFocusCleared(false); }, [activeRef?.raw]);
+  // ambient schedule digest (context bundle): surface-gated, with a per-session explicit toggle
+  const ambientEligible = scheduleEligible(activeList, activeTab);
+  const [includeSchedule, setIncludeSchedule] = useState<boolean | null>(null);
+  useEffect(() => { setIncludeSchedule(readIncludeSchedule(session)); }, [session]);
+  const setAmbient = (v: boolean | null) => { setIncludeSchedule(v); writeIncludeSchedule(session, v); };
+  const ambientOn = includeSchedule !== null ? includeSchedule : ambientEligible;
+  // the bundle focus payload — meeting/file mirror the legacy `active`; workspace/today are new kinds
+  const bundleFocus: FocusPayload | null = focusCleared ? null : focusTarget(activeTab);
   const focusRef = focusCleared ? null : activeRef;
   const meetings = useLiveMeetings();
   const activeMeeting = activeRef?.kind === "meeting"
@@ -688,57 +762,81 @@ export function Chat({ params = {} }: ChatProps) {
       nextId: Math.max(s.nextId, n + 1),
       abort: ctrl,
     }));
+    // Cold-start / mid-turn-drop robustness lives in streamChatTurn: a chat turn spawns a FRESH
+    // per-dispatch worker (docker backend) that takes seconds to boot, and the turn is NEVER lost even
+    // if the SSE closes early (durable, resumable output Stream). So instead of "No chat output arrived"
+    // the instant a stream ends, it RESUMES from the last SSE cursor (Last-Event-ID) and keeps rendering.
+    // A live STATUS LINE (turn.status, driven by onStatus below) keeps the pane VERBOSE about what's
+    // happening — "Starting agent…", "Working · 12s", "Reconnecting…" — so a long think / tool run / a
+    // broken SSE reads as alive, never a frozen blank. Real output (a delta / tool / terminal) clears it.
+    // `since` is per-gap: cleared on output, re-stamped when the next quiet stretch begins, so the counter
+    // measures the CURRENT wait (the useful "is it stuck?" signal), not total turn time.
+    const setStatus = (phase: ChatPhase | null) =>
+      patchAgentTurn(key, agentId, (t) => ({ ...t, status: phase ? { phase, since: t.status?.since ?? Date.now() } : null }));
+    const p = ground ? promptWithActiveContext(basePrompt, contextRef, activeMeeting) : basePrompt;
+    // The active center tab grounds the turn: a meeting passes {kind, platform, native_id, meeting_id} so
+    // agent-api folds its live transcript into the prompt server-side; a file passes {kind, ref}.
+    // P0 (cross-tenant leak fix): `meeting_id` is the meetings-domain ROW id (the mock's `id`) — the
+    // transcript carrier keys on it, so grounding reads THIS row's transcript (`tc:meeting:{row_id}`),
+    // never a DIFFERENT tenant's / an older row's under the shared native. `native_id` is display only.
+    // The meeting's raw STATUS (+ title/when/workspace) rides along so agent-api branches the
+    // grounding by lifecycle phase — prep (no transcript, steer preparation) / live (fold the live
+    // stream) / post (fold the processed notes). A status-less payload keeps the legacy live path.
+    const active = !ground || !contextRef
+      ? undefined
+      : contextRef.kind === "meeting"
+        ? {
+            kind: "meeting", native_id: contextRef.value, meeting_id: activeMeeting?.id,
+            platform: meetingPlatformSlug(activeMeeting),
+            status: activeMeeting?.live_status,
+            title: activeMeeting ? meetingLabel(activeMeeting) : undefined,
+            scheduled_at: activeMeeting?.scheduled_at,
+            workspace_id: activeMeeting?.workspace_id,
+          }
+        : { kind: contextRef.kind, ref: contextRef.raw };
+    // The CONTEXT BUNDLE (slice 1): tz + surface + focus + explicit include toggles. The focus
+    // mirrors `active` for meeting/file (server prefers `context`); workspace/today are new
+    // focus kinds the server folds itself. ground:false (onboarding) sends no bundle at all.
+    const wireFocus: FocusPayload | null | undefined = !ground
+      ? undefined
+      : (active && (active.kind === "meeting" || active.kind === "file"))
+        ? (active as FocusPayload)
+        : bundleFocus;
+    const context = !ground ? undefined : buildChatContext({
+      activeList, activeTab, focus: wireFocus ?? null, includeSchedule,
+    });
     try {
-      const p = ground ? promptWithActiveContext(basePrompt, contextRef, activeMeeting) : basePrompt;
-      // The active center tab grounds the turn: a meeting passes {kind, platform, native_id} so agent-api
-      // folds its live transcript (tc:meeting:{native}) into the prompt server-side; a file passes {kind, ref}.
-      const active = !ground || !contextRef
-        ? undefined
-        : contextRef.kind === "meeting"
-          ? { kind: "meeting", native_id: contextRef.value, platform: meetingPlatformSlug(activeMeeting) }
-          : { kind: contextRef.kind, ref: contextRef.raw };
-      const r = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt: p, session: sessionForSend, active }), signal: ctrl.signal });
-      if (!r.ok) throw new Error(`Chat request failed (${r.status})`);
-      const reader = r.body?.getReader();
-      const dec = new TextDecoder();
-      let buf = "";
-      let sawVisibleOutput = false;
-      while (reader) {
-        const { value: chunk, done } = await reader.read();
-        if (done) break;
-        buf += dec.decode(chunk, { stream: true });
-        const lines = buf.split("\n");
-        buf = lines.pop() ?? "";
-        for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
-          let ev: { type: string; text?: string; tool?: string; sha?: string; ok?: boolean; reply?: string };
-          try { ev = JSON.parse(line.slice(6)); } catch { continue; }
-          if (ev.type === "message-delta") {
-            sawVisibleOutput = sawVisibleOutput || Boolean(ev.text);
-            patchAgentTurn(key, agentId, (t) => ({ ...t, text: (t.text ?? "") + (ev.text ?? "") }));
-          }
-          else if (ev.type === "tool-call") {
-            sawVisibleOutput = true;
-            patchAgentTurn(key, agentId, (t) => ({ ...t, ops: [...t.ops, toolOp(ev.tool ?? "tool")] }));
-          }
-          else if (ev.type === "commit") patchAgentTurn(key, agentId, (t) => ({ ...t, commit: ev.sha }));
-          else if (ev.type === "rejected") patchAgentTurn(key, agentId, (t) => ({ ...t, rejected: "workspace.v1 violation — reverted" }));
-          else if (ev.type === "done" && ev.ok === false) {
-            sawVisibleOutput = true;
-            patchAgentTurn(key, agentId, (t) => ({
-              ...t,
-              text: (t.text ?? "") + (t.text ? "\n\n" : "") + `Model inference failed${ev.reply ? `: ${ev.reply}` : "."}`,
-            }));
-          }
-        }
-        if (stickToBottomRef.current) scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
-      }
-      if (!sawVisibleOutput) {
-        patchAgentTurn(key, agentId, (t) => ({ ...t, text: (t.text ?? "") || "No chat output arrived before the stream closed." }));
+      const result = await streamChatTurn(
+        { prompt: p, session: sessionForSend, active, context },
+        {
+          onStarting: () => {},  // visual is driven by onStatus (below); the stream still signals cold-start here
+          onStatus: (phase) => setStatus(phase),
+          onDelta: (text) => patchAgentTurn(key, agentId, (t) => ({ ...t, status: null, text: (t.text ?? "") + text })),
+          onTool: (tool) => patchAgentTurn(key, agentId, (t) => ({ ...t, status: null, ops: [...t.ops, toolOp(tool)] })),
+          onCommit: (sha) => patchAgentTurn(key, agentId, (t) => ({ ...t, commit: sha })),
+          onRejected: () => patchAgentTurn(key, agentId, (t) => ({ ...t, status: null, rejected: "workspace.v1 violation — reverted" })),
+          onModelFailure: (reply) => patchAgentTurn(key, agentId, (t) => ({ ...t, status: null, text: (t.text ?? "") + (t.text ? "\n\n" : "") + `Model inference failed${reply ? `: ${reply}` : "."}` })),
+          onError: (msg) => patchAgentTurn(key, agentId, (t) => ({ ...t, status: null, text: (t.text ?? "") + (t.text ? "\n\n" : "") + msg })),
+          onProgress: () => { if (stickToBottomRef.current) scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight }); },
+        },
+        { signal: ctrl.signal },
+      );
+      if (!result.aborted && !result.terminal) {
+        // The turn never reached a clean end even after resuming past the hard cap — the connection is
+        // genuinely lost. Say so (fail-loud, P18): append a note if there was partial output, else the
+        // timeout copy. The worker may still finish server-side, so point the user at a reopen.
+        patchAgentTurn(key, agentId, (t) => {
+          const base = t.text ?? "";
+          return { ...t, status: null, text: base
+            ? base + "\n\n_Connection lost before the reply finished — reopen the chat to see the rest if it lands._"
+            : "The agent didn't respond before timing out. Reopen the chat to see the reply if it lands." };
+        });
+      } else {
+        patchAgentTurn(key, agentId, (t) => ({ ...t, status: null }));  // clean end — drop any lingering status line
       }
     } catch (e) {
-      if ((e as Error)?.name === "AbortError") patchAgentTurn(key, agentId, (t) => ({ ...t, text: (t.text ?? "") + (t.text ? "\n\n" : "") + "_stopped_" }));
-      else patchAgentTurn(key, agentId, (t) => ({ ...t, text: (t.text ?? "") + (t.text ? "\n\n" : "") + ((e as Error)?.message || "Chat request failed.") }));
+      if ((e as Error)?.name === "AbortError") patchAgentTurn(key, agentId, (t) => ({ ...t, status: null, text: (t.text ?? "") + (t.text ? "\n\n" : "") + "_stopped_" }));
+      else patchAgentTurn(key, agentId, (t) => ({ ...t, status: null, text: (t.text ?? "") + (t.text ? "\n\n" : "") + ((e as Error)?.message || "Chat request failed.") }));
     } finally {
       updateChatState(key, (s) => ({ ...s, busy: false, abort: null }));
     }
@@ -855,17 +953,62 @@ export function Chat({ params = {} }: ChatProps) {
         onDrop={onDrop}
         style={{ border: "1px solid var(--line2)", borderRadius: 12, background: "var(--panel)", padding: "9px 12px", display: "flex", flexDirection: "column", gap: 7 }}
       >
-        {contextRef && (
-          <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
-            <span style={{ color: "var(--t3)", fontSize: 11, textTransform: "uppercase", letterSpacing: ".05em", flex: "none" }}>Focus</span>
-            <ReferenceChip refToken={contextRef} />
-            <button aria-label="Clear focus" title="Clear focus" onClick={() => setFocusCleared(true)} style={{ background: "none", border: "none", color: "var(--t3)", cursor: "pointer", display: "flex", padding: 0, marginLeft: 2, flex: "none" }}><Icon name="x" size={12} /></button>
+        {(contextRef || ambientEligible || includeSchedule === true || (bundleFocus && (bundleFocus.kind === "workspace" || bundleFocus.kind === "today"))) && (
+          <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, flexWrap: "wrap" }}>
+            {/* ambient schedule chip — the context bundle's always-visible half: on = the agent
+                sees today's schedule; × turns it off for this session; ghost chip re-adds */}
+            {ambientOn ? (
+              <span title="The agent sees your schedule (today, upcoming, live) on this surface"
+                style={{ flex: "none", display: "inline-flex", alignItems: "center", gap: 5, fontSize: 11, color: "var(--t2)", background: "var(--panel2)", border: "1px solid var(--line)", borderRadius: 999, padding: "2px 4px 2px 9px" }}>
+                <Icon name="cal" size={10} /> Schedule · today
+                <button aria-label="Remove schedule context" title="Remove schedule context for this session" onClick={() => setAmbient(false)}
+                  style={{ background: "none", border: "none", color: "var(--t3)", cursor: "pointer", display: "flex", padding: 2 }}><Icon name="x" size={10} /></button>
+              </span>
+            ) : ambientEligible ? (
+              <button onClick={() => setAmbient(null)} title="Include your schedule in the agent's context"
+                style={{ flex: "none", display: "inline-flex", alignItems: "center", gap: 4, fontSize: 11, color: "var(--t3)", background: "transparent", border: "1px dashed var(--line2)", borderRadius: 999, padding: "2px 9px", cursor: "pointer" }}>
+                + schedule
+              </button>
+            ) : null}
+            {/* B4 carve: the meeting focus is ONE chip — `Preparing · Title ×` — never a mono
+                uppercase label plus a second raw-id Focus chip for the same meeting. */}
+            {contextRef && contextRef.kind === "meeting" && activeMeeting ? (() => {
+              const mode = MODE_CHIP[meetingPhase(activeMeeting)];
+              return (
+                <span title={`This chat is grounded in the meeting's ${mode.label.toLowerCase()} state`}
+                  style={{ flex: "none", display: "inline-flex", alignItems: "center", gap: 6, fontSize: 11.5,
+                    fontWeight: 600, color: mode.color, background: mode.bg, borderRadius: 999,
+                    padding: "2px 5px 2px 10px", maxWidth: 260, minWidth: 0 }}>
+                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
+                    {mode.label} · {meetingLabel(activeMeeting)}
+                  </span>
+                  <button aria-label="Clear focus" title="Clear focus" onClick={() => setFocusCleared(true)}
+                    style={{ background: "none", border: "none", color: mode.color, opacity: 0.7, cursor: "pointer", display: "flex", padding: 2, flex: "none" }}><Icon name="x" size={10} /></button>
+                </span>
+              );
+            })() : contextRef ? (
+              <>
+                <span style={{ color: "var(--t3)", fontSize: 11, textTransform: "uppercase", letterSpacing: ".05em", flex: "none" }}>Focus</span>
+                <ReferenceChip refToken={contextRef} />
+                <button aria-label="Clear focus" title="Clear focus" onClick={() => setFocusCleared(true)} style={{ background: "none", border: "none", color: "var(--t3)", cursor: "pointer", display: "flex", padding: 0, marginLeft: 2, flex: "none" }}><Icon name="x" size={12} /></button>
+              </>
+            ) : null}
+            {!contextRef && bundleFocus && (bundleFocus.kind === "workspace" || bundleFocus.kind === "today") && (
+              <>
+                <span style={{ color: "var(--t3)", fontSize: 11, textTransform: "uppercase", letterSpacing: ".05em", flex: "none" }}>Focus</span>
+                <span style={{ flex: "none", display: "inline-flex", alignItems: "center", gap: 5, fontSize: 11, color: bundleFocus.kind === "workspace" ? "var(--blue)" : "var(--t2)", background: bundleFocus.kind === "workspace" ? "var(--bluebg)" : "var(--panel2)", border: "1px solid var(--line)", borderRadius: 6, padding: "1px 7px" }}>
+                  <Icon name={bundleFocus.kind === "workspace" ? "panel" : "cal"} size={10} />
+                  {bundleFocus.kind === "workspace" ? `Workspace · ${bundleFocus.slug}` : "Today"}
+                </span>
+                <button aria-label="Clear focus" title="Clear focus" onClick={() => setFocusCleared(true)} style={{ background: "none", border: "none", color: "var(--t3)", cursor: "pointer", display: "flex", padding: 0, marginLeft: 2, flex: "none" }}><Icon name="x" size={12} /></button>
+              </>
+            )}
           </div>
         )}
         <ComposerReferences text={value} />
         <AttachmentChips attachments={attachments} onRemove={removeAttachment} />
-        {uploadError && <div style={{ color: "var(--danger, #ff8b8b)", fontSize: 12, lineHeight: 1.35 }}>{uploadError}</div>}
-        {micError && <div style={{ color: "var(--danger, #ff8b8b)", fontSize: 12, lineHeight: 1.35 }}>{micError}</div>}
+        {uploadError && <div style={{ color: "var(--danger)", fontSize: 12, lineHeight: 1.35 }}>{uploadError}</div>}
+        {micError && <div style={{ color: "var(--danger)", fontSize: 12, lineHeight: 1.35 }}>{micError}</div>}
         <input
           ref={fileInputRef}
           type="file"
@@ -887,7 +1030,9 @@ export function Chat({ params = {} }: ChatProps) {
               e.preventDefault();
               void onSubmit();
             }}
-            placeholder="Type / for skills, or ask the agent…"
+            placeholder={contextRef?.kind === "meeting" && activeMeeting
+              ? MODE_PLACEHOLDER[meetingPhase(activeMeeting)]
+              : "Type / for skills, or ask the agent…"}
             disabled={uploading}
             rows={1}
             style={{ flex: 1, background: "none", border: "none", outline: "none", color: "var(--t1)", fontSize: 14, lineHeight: "20px", minWidth: 0, minHeight: 28, maxHeight: MAX_TEXTAREA_HEIGHT, resize: "none", overflowY: "hidden", padding: "4px 0", margin: 0, fontFamily: "inherit" }}
@@ -902,9 +1047,9 @@ export function Chat({ params = {} }: ChatProps) {
             disabled={uploading || mic === "stt"}
             onClick={() => void toggleMic()}
             style={{
-              background: mic === "rec" ? "var(--livebg)" : "transparent",
-              color: mic === "rec" ? "var(--live)" : "var(--t3)",
-              border: `1px solid ${mic === "rec" ? "var(--live)" : "var(--line2)"}`,
+              background: mic === "rec" ? "var(--accentbg)" : "transparent",
+              color: mic === "rec" ? "var(--accent)" : "var(--t3)",
+              border: `1px solid ${mic === "rec" ? "var(--accent)" : "var(--line2)"}`,
               width: 30, height: 30, borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "center",
               cursor: uploading || mic === "stt" ? "default" : "pointer", flex: "none", opacity: mic === "stt" ? 0.6 : 1,
             }}>
@@ -914,7 +1059,7 @@ export function Chat({ params = {} }: ChatProps) {
           </button>
           {busy
             ? <button aria-label="Stop" title="Stop" onClick={stop} style={{ background: "var(--panel2)", color: "var(--t1)", border: "1px solid var(--line2)", width: 30, height: 30, borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flex: "none" }}><span style={{ width: 10, height: 10, background: "var(--t1)", borderRadius: 2, display: "block" }} /></button>
-            : <button aria-label="Send" disabled={uploading} onClick={() => void onSubmit()} style={{ background: "var(--accent)", color: "#241008", border: "none", width: 30, height: 30, borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "center", cursor: uploading ? "default" : "pointer", flex: "none", opacity: uploading ? 0.7 : 1 }}><Icon name="send" size={16} /></button>}
+            : <button aria-label="Send" disabled={uploading} onClick={() => void onSubmit()} style={{ background: "var(--accent)", color: "var(--on-accent)", border: "none", width: 30, height: 30, borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "center", cursor: uploading ? "default" : "pointer", flex: "none", opacity: uploading ? 0.7 : 1 }}><Icon name="send" size={16} /></button>}
         </div>
       </div>
     </>

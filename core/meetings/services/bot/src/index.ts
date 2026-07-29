@@ -12,7 +12,7 @@
  * ├─ INCREMENT 2b wires the browser join + capture + recording (THIS file):
  * │    • JoinDriver     → @vexa/join.joinMeeting over a @vexa/remote-browser page               ✅ WIRED (L4)
  * │    • Pipeline       → capture bridge → @vexa/{gmeet,mixed}-pipeline → @vexa/transcribe-whisper ✅ WIRED (L4 capture · L2/L3 lane)
- * │    • RecordingSink  → @vexa/recording assembler → upload to inv.recordingUploadUrl          ✅ WIRED (L4 upload · L2/L3 assembler)
+ * │    • RecordingSink  → per-chunk upload to inv.recordingUploadUrl (master assembled server-side) ✅ WIRED (L4 upload · L3 sink)
  * │    • Speak          → acts.v1 `speak`/`speak_stop` → meeting-UI mic + VM TTS chain          ✅ WIRED (L4)
  * └─ The browser/capture/recording-upload/speak legs are BROWSER- or VM-resident → L4-gated
  *    (proven by the O6 VM run, not unit tests). The lane + assembler cores are L2/L3-proven.
@@ -22,16 +22,21 @@
  * terminal `failed` (join_failure) rather than crashing the root — same disposability as the
  * lazy redis connect.
  */
-import { loadInvocation, InvocationError, type Invocation } from './config.js';
+import { createClient } from 'redis';
+import { loadInvocation, InvocationError, speakerStreamConfigFromEnv, type Invocation } from './config.js';
 import type { Act, LifecycleEvent } from './contracts.js';
 import { createOrchestrator } from './orchestrator.js';
 import { createHttpLifecycleSink } from './adapters/lifecycle-http.js';
 import { createRedisTranscriptSink, redisClientFrom } from './adapters/transcript-redis.js';
 import { createRedisActsSource, redisActsClientFrom } from './adapters/acts-redis.js';
 import { createBrowserJoinDriver } from './join-driver.js';
-import { createBotPipeline, type BotPipeline } from './pipeline.js';
+import { createBotPipeline, createLivePipeline, createTranscribe, serr, type BotPipeline } from './pipeline.js';
 import { createBotRecordingSink } from './recording.js';
+import { createCaptureSignalRecorder, wrapTranscribeWithTap, type CaptureSignalRecorder } from './telemetry.js';
+import { createSttFaultReporter } from './stt-faults.js';
 import { launchBrowser, startCaptureBridge, startRecording, createSpeakController, type BrowserSession, type SpeakController } from './capture-bridge.js';
+import { createRemoteAudioActivityTap, createSilenceAlonenessSource, resolveAloneSilenceWindowMs } from './aloneness.js';
+import { installSignalHandlers } from './signals.js';
 import type {
   JoinDriver,
   Pipeline,
@@ -52,9 +57,10 @@ function consoleLifecycleSink(): LifecycleSink {
  *  the orchestrator drives to a clean terminal `failed`(join_failure) instead of the root crashing. */
 function noBrowserJoinDriver(reason: string): JoinDriver {
   return {
-    async join() { console.error(`[bot] no browser session: ${reason}`); return 'error'; },
+    async join() { console.error(`[bot] no browser session: ${reason}`); return { outcome: 'error', reason: `no browser session: ${reason}` }; },
     onRemoval() { return () => { /* */ }; },
     async leave() { /* */ },
+    async withdraw() { /* no browser — nothing to withdraw */ },
   };
 }
 
@@ -76,19 +82,16 @@ function meetingChannelId(inv: Invocation): string | number {
  *
  *  `orchestrator.run({ maxActiveMs })` is a HARD ceiling on the active phase that resolves to
  *  `completed(max_bot_time_exceeded)` — a backstop so a bot can never live forever (the granular
- *  empty-room / waiting-room timeouts that map to left_alone/startup_alone are driven by the
- *  Pipeline/JoinDriver in 2b). This is a GENEROUS backstop (default 4h, override with
- *  BOT_MAX_ACTIVE_MS in ms) — the granular empty-room / waiting-room timeouts drive every NORMAL exit
- *  well before this fires. We floor it at max(everyoneLeft, noOneJoined, waitingRoom) + 60s margin so
- *  the backstop can never undercut those granular timeouts. */
+ *  silence timeout that maps to left_alone is driven by the injected AlonenessSource). This is a
+ *  GENEROUS backstop (default 4h, override with BOT_MAX_ACTIVE_MS in ms). We floor it at the largest
+ *  configured lifecycle timeout + 60s so it cannot undercut a more specific lifecycle verdict. */
 const DEFAULT_MAX_ACTIVE_MS = 4 * 60 * 60 * 1000; // 4 hours
-function deriveMaxActiveMs(inv: Invocation, env: NodeJS.ProcessEnv = process.env): number {
+function deriveMaxActiveMs(inv: Invocation, everyoneLeftMs: number, env: NodeJS.ProcessEnv = process.env): number {
   const al = inv.automaticLeave ?? {};
-  const everyoneLeft = al.everyoneLeftTimeout ?? 120_000;
   const noOneJoined = al.noOneJoinedTimeout ?? 600_000;
   const waitingRoom = al.waitingRoomTimeout ?? 300_000;
   const MARGIN_MS = 60_000; // give the granular timeouts room to fire first
-  const floor = Math.max(everyoneLeft, noOneJoined, waitingRoom) + MARGIN_MS;
+  const floor = Math.max(everyoneLeftMs, noOneJoined, waitingRoom) + MARGIN_MS;
   const override = Number(env.BOT_MAX_ACTIVE_MS);
   const cap = Number.isFinite(override) && override > 0 ? override : DEFAULT_MAX_ACTIVE_MS;
   return Math.max(cap, floor);
@@ -119,6 +122,26 @@ function voiceHandler(speak: SpeakController): (act: Act) => Promise<void> {
     if (act.action === 'speak') await speak.speak(act.text, act.voice);
     else if (act.action === 'speak_stop') await speak.stop();
   };
+}
+
+/**
+ * Probe the SECONDARY control-plane channel (redis) for the reachability gate (#530). A fresh,
+ * short-lived connection with a bounded connect timeout and NO reconnection — a single yes/no on
+ * whether redis answers a PING. Never throws: any fault resolves to `false` (unreachable). Uses a
+ * throwaway client (not the lazy transcript/acts clients) so the probe can't disturb their state.
+ */
+async function pingRedis(redisUrl: string, timeoutMs = 3000): Promise<boolean> {
+  const client = createClient({ url: redisUrl, socket: { connectTimeout: timeoutMs, reconnectStrategy: false } });
+  client.on('error', () => { /* swallow — the probe's verdict is the return value, not a throw */ });
+  try {
+    await client.connect();
+    const pong = await client.ping();
+    return pong === 'PONG';
+  } catch {
+    return false;
+  } finally {
+    await client.disconnect().catch(() => { /* best-effort */ });
+  }
 }
 
 export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number> {
@@ -164,35 +187,74 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
   let join: JoinDriver;
   let pipeline: Pipeline;
   let botPipeline: BotPipeline | null = null;
-  let stopCapture: () => Promise<void> = async () => { /* no-op until pipeline.start() wires capture */ };
-  let stopRecording: () => Promise<void> = async () => { /* no-op until pipeline.start() wires recording */ };
   let acts: ActsSource = liveActs;
   const recording = inv.recordingEnabled ? createBotRecordingSink({ inv, log: (m) => console.log(`[bot] ${m}`) }) : undefined;
+  // O-TEL-1: persist the raw captured-signal.v1 stream for offline replay. Off ⇒ the tap is a
+  // single undefined-check and the capture path is byte-for-byte unchanged. VEXA_CAPTURE_SIGNAL=1
+  // enables it without a control plane (the local hot-loop path).
+  const signalRecorder: CaptureSignalRecorder | null =
+    (inv.captureSignalEnabled ?? env.VEXA_CAPTURE_SIGNAL === '1')
+      ? createCaptureSignalRecorder(inv)
+      : null;
+  if (signalRecorder) console.log(`[bot] capture-signal recording → ${signalRecorder.path}`);
+  // Counts STT failures across the meeting so the terminal lifecycle event can carry WHY a
+  // transcript is short or empty, instead of leaving it indistinguishable from a silent room.
+  const sttFaults = createSttFaultReporter();
+  const speakerStreamConfig = speakerStreamConfigFromEnv(env);
+  const remoteAudioActivity = createRemoteAudioActivityTap();
+  const aloneSilenceWindowMs = resolveAloneSilenceWindowMs(inv.automaticLeave?.everyoneLeftTimeout, env);
+  const aloneness = createSilenceAlonenessSource({ activity: remoteAudioActivity, windowMs: aloneSilenceWindowMs });
+  console.log(`[bot] aloneness: silence adapter enabled (window_ms=${aloneSilenceWindowMs})`);
+  if (speakerStreamConfig) console.log(`[bot] speaker-stream tuning enabled: ${JSON.stringify(speakerStreamConfig)}`);
 
   try {
     session = await launchBrowser(inv);                                   // L4 (O6/VM)
     join = createBrowserJoinDriver(session.page, inv);
-    botPipeline = createBotPipeline(inv, transcript, { onError: (e) => console.error(`[bot] pipeline fault: ${String(e)}`) });
+    botPipeline = createBotPipeline(inv, transcript, {
+      // When recording, tee every STT round-trip to <session>.stt.jsonl (the capture/STT/assembly bisect).
+      transcribe: signalRecorder ? wrapTranscribeWithTap(createTranscribe(inv), signalRecorder.path) : undefined,
+      config: speakerStreamConfig,
+      // Every STT fault is counted and carried out on the terminal lifecycle event (see
+      // sttFaults). Logging it here as well keeps the raw line for anyone tailing the container.
+      onError: (e) => { sttFaults.record(e); console.error(`[bot] pipeline fault: ${String(e)}`); },
+    });
     // Defer the page-side capture start to pipeline.start(): the orchestrator calls it AFTER
     // admission (orchestrator.ts:125), on the LIVE meeting page — where addInitScript has injected
     // window.VexaBrowserUtils and the participant <audio> elements exist. Starting it at launch ran
     // the page.evaluate on the BLANK pre-navigation page (no VexaBrowserUtils, no audio), and the
     // subsequent goto to the meeting URL destroyed that context — so capture never attached. (L4.)
     const sess = session, bp = botPipeline, rec = recording;
-    pipeline = {
-      async start() {
-        stopCapture = await startCaptureBridge(sess.page, inv, bp);   // on the live meeting page
-        if (rec) stopRecording = await startRecording(sess.page, inv, rec);   // MediaRecorder → recording.v1
-        await bp.start();
-      },
-      async stop() {
-        const sc = stopCapture; stopCapture = async () => {};
-        await sc().catch(() => { /* best-effort */ });
-        const sr = stopRecording; stopRecording = async () => {};
-        await sr().catch(() => { /* best-effort */ });   // flush the final chunk → master assembly
-        await bp.stop();
-      },
+    // In-meeting chat (jitsi lane) → a transcript.v1 `chat` segment: the sender is the
+    // speaker, the wall clock is the timing (epoch seconds, like the audio lanes), and
+    // `completed` is immediate — a chat line has no draft phase.
+    let chatSeq = 0;
+    const publishChat = (sender: string, text: string): void => {
+      const nowMs = Date.now();
+      void transcript.publish({
+        segment_id: `${inv.connectionId ?? 'session'}:chat:${nowMs}:${chatSeq++}`,
+        speaker: sender,
+        speaker_key: `chat:${sender}`,
+        text,
+        start: nowMs / 1000,
+        end: nowMs / 1000,
+        completed: true,
+        source: 'chat',
+        absolute_start_time: new Date(nowMs).toISOString(),
+        absolute_end_time: new Date(nowMs).toISOString(),
+      }).catch((e) => console.error(`[bot] chat publish rejected: ${String(e)}`));
     };
+    // #593: a post-admission subsystem failure must NEVER self-evict. createLivePipeline wraps the
+    // page-side capture + recording attach + the engine start so pipeline.start() ALWAYS RESOLVES;
+    // each failure surfaces LOUD via onFault (console with a full-fidelity serr(e)) instead of
+    // throwing into the orchestrator's leave-on-fail backstop (which would hang the bot up).
+    pipeline = createLivePipeline({
+      startCapture: () => startCaptureBridge(sess.page, inv, bp, signalRecorder?.sink, publishChat, remoteAudioActivity),   // on the live meeting page
+      startRecording: rec ? () => startRecording(sess.page, inv, rec) : undefined,          // MediaRecorder → recording.v1
+      engine: bp,
+      onFault: (stage, e) => {
+        console.error(`[bot] live-pipeline: ${stage} failed (non-fatal, bot stays seated): ${serr(e)}`);
+      },
+    });
     // Voice: tee acts so `speak`/`speak_stop` reach the SpeakController (gated on voiceAgentEnabled).
     const speak = createSpeakController(session.page, inv);
     acts = teeActs(liveActs, voiceHandler(speak));
@@ -203,29 +265,41 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     acts = liveActs;
   }
 
+  // Reachability gate (#530): only meaningful under a control plane (a callback URL is set). When
+  // present, the orchestrator makes the first `joining` emit load-bearing and, if the callback is
+  // unreachable, probes redis before refusing to join. Self-host (no callback) has no gate.
+  const reachability = inv.meetingApiCallbackUrl
+    ? { probeSecondary: () => pingRedis(inv.redisUrl) }
+    : undefined;
+
   const orchestrator = createOrchestrator(inv, {
     lifecycle,
     join,
     pipeline,
     acts,
+    aloneness,
     recording: recording as RecordingSink | undefined,
+    reachability,
+    degraded: () => sttFaults.report(),
   });
 
-  // Disposability (P7): a termination signal ends the active phase gracefully (leave →
-  // completed) so the container never hangs after `active`. Wire before run(); unwire after.
-  const onSignal = () => orchestrator.stop('stopped');
-  process.once('SIGTERM', onSignal);
-  process.once('SIGINT', onSignal);
+  // Disposability (P7): a termination signal ends the active phase gracefully (leave → flush →
+  // terminal callback → exit 0) so the container never hangs after `active` — BOUNDED by the
+  // force-exit watchdog in signals.ts (<25s, inside the runtime's SIGTERM→SIGKILL stop grace) so
+  // a wedged teardown can never ride a `docker stop` all the way to a silent 137 (the incident's
+  // exit code on BOTH orphaned bots). Wire before run(); release the listeners after.
+  const releaseSignals = installSignalHandlers({ stop: (reason) => orchestrator.stop(reason) });
   try {
-    const result = await orchestrator.run({ maxActiveMs: deriveMaxActiveMs(inv) });
+    const result = await orchestrator.run({ maxActiveMs: deriveMaxActiveMs(inv, aloneSilenceWindowMs, env) });
     return result.exitCode;
   } finally {
-    process.off('SIGTERM', onSignal);
-    process.off('SIGINT', onSignal);
-    // Tear down the capture bridge + browser (best-effort — a teardown failure must not change
-    // the exit code). The orchestrator already stopped the pipeline + left the meeting.
-    await stopCapture().catch(() => { /* best-effort */ });
-    await stopRecording().catch(() => { /* best-effort */ });
+    releaseSignals();
+    // Tear down the pipeline (capture bridge + recording + engine) + browser (best-effort — a
+    // teardown failure must not change the exit code). The orchestrator already stopped the pipeline
+    // on a normal end; createLivePipeline.stop() is idempotent, and this also covers an early-exit
+    // path that skipped the orchestrator's teardown. (#593)
+    await pipeline.stop().catch(() => { /* best-effort */ });
+    await signalRecorder?.close().catch(() => { /* best-effort */ });
     if (session) await session.close().catch(() => { /* best-effort */ });
     // Quit the redis connections on teardown (best-effort — a quit failure must not change the
     // exit code; they may never have connected if redis was unreachable).

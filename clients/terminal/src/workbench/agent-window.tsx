@@ -4,17 +4,44 @@
  *  visible — read/search/edit/git/web steps with live status, not just final text) · the composer ·
  *  proposed actions directly under the input. The right-rail chat and the `meeting` copilot render
  *  through this, so they look and behave like one product. */
-import { type CSSProperties, type ReactNode, type RefObject } from "react";
+import { type CSSProperties, type ReactNode, type RefObject, useEffect, useState } from "react";
 import { Icon } from "../ui-kit";
 import { Markdown } from "../ui-kit/Markdown";
 
 // ── the turn model ────────────────────────────────────────────────────────────────
 export type OpStatus = "running" | "done" | "error";
 export interface Op { icon: string; label: string; status: OpStatus }   // icon ∈ ui-kit (file/search/edit/git/web/zap…)
+/** The live phase of an in-flight agent turn (see chatStream `ChatPhase`), plus when it began so the UI
+ *  can tick an elapsed-seconds counter. Rendered as a verbose status line so the pane never looks frozen. */
+export type TurnPhase = "connecting" | "working" | "reconnecting" | "stalled";
+export interface TurnStatus { phase: TurnPhase; since: number }
 export type Turn =
   | { id: string; role: "user"; text: string }
-  | { id: string; role: "agent"; text: string; ops: Op[]; commit?: string; rejected?: string }
+  | { id: string; role: "agent"; text: string; ops: Op[]; commit?: string; rejected?: string; status?: TurnStatus | null }
   | { id: string; role: "insight"; t?: string; text: string };
+
+const PHASE_LABEL: Record<TurnPhase, string> = {
+  connecting: "Starting agent",
+  working: "Working",
+  reconnecting: "Reconnecting",
+  stalled: "Connection stalled — retrying",
+};
+
+/** A live "what's happening" line for the in-flight turn — spinner + phase + elapsed seconds, self-ticking
+ *  so a long think / tool run / reconnect reads as ALIVE, not stale. Reconnect/stall use an alert color. */
+function StatusLine({ status }: { status: TurnStatus }) {
+  const [, force] = useState(0);
+  useEffect(() => { const t = setInterval(() => force((n) => n + 1), 1000); return () => clearInterval(t); }, []);
+  const secs = Math.max(0, Math.floor((Date.now() - status.since) / 1000));
+  const alert = status.phase === "reconnecting" || status.phase === "stalled";
+  const color = alert ? "var(--accent)" : "var(--t3)";
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 4, fontSize: 12, color, fontFamily: "var(--mono)" }}>
+      <span className="vx-op-spin" style={{ width: 11, height: 11, borderRadius: "50%", border: "1.5px solid var(--line2)", borderTopColor: color, flex: "none" }} />
+      <span>{PHASE_LABEL[status.phase]}{secs >= 2 ? ` · ${secs}s` : ""}{alert ? "" : "…"}</span>
+    </div>
+  );
+}
 
 export const opIcon: Record<string, string> = { read: "file", search: "search", edit: "edit", write: "file", git: "git", web: "web", tool: "zap" };
 
@@ -26,7 +53,7 @@ function linkify(text: string): ReactNode[] {
 // ── one operation step (the "what's in works" line) ──────────────────────────────
 function OpRow({ op }: { op: Op }) {
   const running = op.status === "running";
-  const color = op.status === "error" ? "var(--live)" : op.status === "done" ? "var(--green)" : "var(--accent)";
+  const color = op.status === "error" ? "var(--danger)" : op.status === "done" ? "var(--green)" : "var(--accent)";
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 8, fontFamily: "var(--mono)", fontSize: 11.5, lineHeight: 1.5, color: running ? "var(--t1)" : "var(--t2)" }}>
       <span style={{ width: 13, flex: "none", display: "inline-flex", alignItems: "center", justifyContent: "center" }}>
@@ -63,14 +90,17 @@ export function Conversation({ turns, busy, empty }: { turns: Turn[]; busy?: boo
                 {t.ops.map((op, j) => <OpRow key={j} op={op} />)}
               </div>
             )}
-            {(t.text || (busy && last)) && <div style={{ fontSize: 13.5, color: "var(--t1)", lineHeight: 1.6, maxWidth: 680 }}>{t.text ? <Markdown>{t.text}</Markdown> : <span style={{ color: "var(--t3)" }}>…</span>}</div>}
+            {t.text && <div style={{ fontSize: 13.5, color: "var(--t1)", lineHeight: 1.6, maxWidth: 680 }}><Markdown>{t.text}</Markdown></div>}
+            {busy && last && (t.status
+              ? <StatusLine status={t.status} />
+              : (!t.text && <div style={{ fontSize: 13.5, color: "var(--t3)" }}>…</div>))}
             {t.commit && (
               <div style={{ marginTop: 9, fontSize: 11, color: "var(--green)", display: "inline-flex", alignItems: "center", gap: 6, background: "var(--greenbg)", borderRadius: 6, padding: "3px 8px", fontFamily: "var(--mono)" }}>
                 <Icon name="git" size={12} />committed · {t.commit.slice(0, 7)}
               </div>
             )}
             {t.rejected && (
-              <div style={{ marginTop: 9, fontSize: 11, color: "var(--live)", display: "inline-flex", alignItems: "center", gap: 6, background: "var(--livebg)", borderRadius: 6, padding: "3px 8px" }}>
+              <div style={{ marginTop: 9, fontSize: 11, color: "var(--danger)", display: "inline-flex", alignItems: "center", gap: 6, background: "var(--dangerbg)", borderRadius: 6, padding: "3px 8px" }}>
                 <Icon name="x" size={12} />{t.rejected}
               </div>
             )}
@@ -86,7 +116,7 @@ export function AgentWindow({ top, scrollRef, children, composer, actions }: {
   top?: ReactNode; scrollRef?: RefObject<HTMLDivElement | null>; children: ReactNode; composer: ReactNode; actions?: ReactNode;
 }) {
   return (
-    <div style={{ height: "100%", display: "flex", flexDirection: "column", minHeight: 0, background: "var(--bg)" }}>
+    <div style={{ height: "100%", display: "flex", flexDirection: "column", minHeight: 0, background: "var(--rail)" }}>
       {top}
       <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", minHeight: 0, padding: "18px 22px" }}>{children}</div>
       <div style={{ borderTop: "1px solid var(--line)", padding: "12px 22px 14px", flex: "none" }}>

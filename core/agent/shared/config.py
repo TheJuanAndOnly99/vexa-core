@@ -57,7 +57,14 @@ class Settings(BaseSettings):
     # Registry of workspace templates (workspace-seeds/<name>/); `default_template` selects one.
     # `seeding.resolve_seed_dir` is the selection seam (honors the VEXA_WORKSPACE_SEED_DIR override).
     workspace_seeds_dir: str = "/app/workspace-seeds"
-    default_template: str = "finos"  # FINOS-ecosystem KG seed; override with VEXA_DEFAULT_TEMPLATE=default for the bare scaffold
+    default_template: str = "default"  # light ready-to-go scaffold (README = onboarding-dashboard); override with VEXA_DEFAULT_TEMPLATE=finos for the FINOS KG seed
+    # ── three-tier mount stack (AMENDMENT 4) — the GLOBAL SYSTEM tier (_global) ──
+    # The platform-owned, READ-ONLY _global workspace mounted into EVERY worker (behaviour/skills/tools).
+    # A host path / repo dir; empty = no _global mount (the stack degrades to _system + the active set).
+    # A live MOUNT (updating this ONE repo propagates to all agents next turn), not a copy-once seed.
+    global_system_workspace_path: str = ""
+    # Pin the _global mount to a ref (branch/tag/sha) for safe rollout; empty = mount HEAD (main).
+    global_system_workspace_ref: str = ""
     agent_model: str = ""
     meeting_model: str = ""
     # ── llm module dials (provider-agnostic; see core/agent/llm/README.md) ────
@@ -68,6 +75,10 @@ class Settings(BaseSettings):
     llm_model: str = ""         # deployment-default model (free string)
     model_allowlist: str = ""   # optional comma-separated gate on workspace-pinned models
     meeting_idle_timeout_sec: int = Field(default=4 * 60 * 60, ge=60)
+    # How long a CHAT worker serves its unit:<id>:in topic after the last turn before exiting
+    # (TTL-on-idle). A live worker takes the thread's next message WARM (no container/CLI cold
+    # start) — the window is the warm-hit budget; an idle worker costs only its parked memory.
+    chat_idle_timeout_sec: int = Field(default=900, ge=30)
 
     # ── MVP3 toolbelt — tool.v1 descriptors + MCP launch specs (the generic tool mechanism) ──
     # A unit's unit.v1.tools names resolve against this dir into --allowedTools + an .mcp.json.
@@ -77,12 +88,27 @@ class Settings(BaseSettings):
     # runtime scheduler. Set to 0 to disable the background reconciler.
     routine_reconcile_interval_sec: int = Field(default=60, ge=0)
 
+    # ── membership index seam (Lane M) — users.data.memberships[] lives in Postgres, reachable ONLY
+    # from the identity admin-api; agent-api holds the AUTHORITATIVE store (policy/members.json in the
+    # workspace git repo) and mirrors the derived index over this internal edge. Empty base URL = the
+    # in-memory index (git files stay authoritative; only the "shared with me" listing is degraded).
+    admin_api_url: str = ""                       # e.g. http://admin-api:8001; empty = no index mirror
+    # meeting-api base URL — agent-api hits GET /meetings/{id} on it to OWNER-SCOPE the live SSE stream
+    # (P0 cross-tenant leak fix, SSE sibling): the caller-supplied meeting_id (row id) is verified to
+    # belong to the authenticated X-User-Id BEFORE the redis transcript stream is opened, mirroring the
+    # WS /ws authorize_subscribe ownership gate. meeting-api trusts the gateway-injected X-User-Id the
+    # same way its own /transcripts/by-id path does.
+    meeting_api_url: str = "http://meeting-api:8080"
+    # The X-Internal-Secret the admin-api's internal tier checks (same value the gateway uses). SecretStr.
+
     # ── secrets (never logged, committed, or in goldens) — P14 / P15 ─────────
     # Brokered, scoped identity the worker presents (ADR-0003): a port, not a raw key here.
     agent_identity_token: SecretStr = SecretStr("")
     # The shared key the Identity service signs per-dispatch tokens with (dev tier); every boundary
     # verifies with the same key. k8s replaces this with SPIRE-issued SVIDs behind the same interface.
     dispatch_signing_key: SecretStr = SecretStr("dev-dispatch-signing-key")
+    # Internal-tier shared secret for the admin-api membership-index edge (Lane M).
+    internal_api_secret: SecretStr = SecretStr("")
 
     def is_secret_present(self) -> bool:
         """True when a scoped identity token has been provided (without revealing it)."""

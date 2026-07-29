@@ -275,6 +275,17 @@
       ]
     },
     {
+      "unique-id": "jitsi-capture",
+      "node-type": "module",
+      "name": "jitsi-capture",
+      "description": "jitsi-capture \u2014 atomic module in meetings",
+      "metadata": [
+        {
+          "path": "core/meetings/modules/jitsi-capture"
+        }
+      ]
+    },
+    {
       "unique-id": "join",
       "node-type": "module",
       "name": "join",
@@ -453,6 +464,18 @@
       "metadata": [
         {
           "path": "core/agent/contracts/unit.v1",
+          "domain": "agent"
+        }
+      ]
+    },
+    {
+      "unique-id": "processed-notes.v1",
+      "node-type": "contract",
+      "name": "processed-notes.v1",
+      "description": "processed-notes.v1 \u2014 sealed/published contract (agent): the proc:meeting:{row_id} cleaned-notes stream + view_end terminal marker (agent-worker \u2192 meeting-api db-writer / agent-api SSE; ADR-0027)",
+      "metadata": [
+        {
+          "path": "core/agent/contracts/processed-notes.v1",
           "domain": "agent"
         }
       ]
@@ -760,7 +783,7 @@
       "unique-id": "proc-stream",
       "node-type": "data-asset",
       "name": "proc:meeting:{id} (stream)",
-      "description": "cleaned 1:1 processed transcript mirror, keyed by segment_id; agent-worker is the writer",
+      "description": "cleaned 1:1 processed transcript, keyed by segment_id, + the view_end terminal marker (processed-notes.v1, ADR-0027); agent-worker is the writer; read by meeting-api's db-writer (durable data.processed.views) and agent-api's live SSE",
       "controls": {
         "ownership": {
           "description": "single writer (P23)",
@@ -791,7 +814,7 @@
       "unique-id": "out-stream",
       "node-type": "data-asset",
       "name": "unit:{id}:out (stream)",
-      "description": "worker output stream (cards/notes/message deltas); agent-api relays as SSE",
+      "description": "worker output stream (cards / agent activity / message deltas \u2014 notes moved to proc-stream per ADR-0027); agent-api relays as SSE",
       "controls": {
         "ownership": {
           "description": "single writer (P23)",
@@ -954,6 +977,33 @@
       ]
     },
     {
+      "unique-id": "userdata-blob",
+      "node-type": "data-asset",
+      "name": "userdata bucket (blob)",
+      "description": "authenticated-bot browser sessions (auth-essential profile subset): remote-browser's provisioning login uploads the signed-in session; the bot restores it before launch and writes the rotated session back on clean teardown",
+      "controls": {
+        "ownership": {
+          "description": "two writers by design: remote-browser=provisioning upload, bot=write-back on teardown",
+          "requirements": [
+            {
+              "requirement-url": "https://vexa.ai/calm/controls/single-writer.requirement.json",
+              "config": {
+                "writers": [
+                  "remote-browser",
+                  "bot"
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "metadata": [
+        {
+          "stage": "session"
+        }
+      ]
+    },
+    {
       "unique-id": "runtime",
       "node-type": "service",
       "name": "runtime",
@@ -1106,6 +1156,18 @@
           ]
         }
       }
+    },
+    {
+      "unique-id": "dashboard",
+      "node-type": "webclient",
+      "name": "dashboard (deprecated)",
+      "description": "dashboard \u2014 DEPRECATED 0.10 web client, shipped as an off-by-default compose/helm option while still load-bearing (#813): the multi-user UI hosted production runs against the 0.12 core via the gateway's hosted-compat surface. External pinned image (vexaai/dashboard), not built from this tree; versions on its own tag, never global.imageTag. Deprecation exit: deleted when the terminal covers the authenticated-session/browser-session flows.",
+      "metadata": [
+        {
+          "path": "deploy/compose",
+          "external-image": "vexaai/dashboard"
+        }
+      ]
     }
   ],
   "relationships": [
@@ -1123,6 +1185,7 @@
             "task.v1",
             "tool.v1",
             "unit.v1",
+            "processed-notes.v1",
             "workspace.v1",
             "agent-worker",
             "out-stream",
@@ -1175,6 +1238,7 @@
             "capture-codec",
             "gmeet-capture",
             "gmeet-pipeline",
+            "jitsi-capture",
             "join",
             "mixed-capture-core",
             "mixed-pipeline",
@@ -1199,7 +1263,8 @@
             "u-meetings",
             "bot-commands",
             "segments-table",
-            "recording-blob"
+            "recording-blob",
+            "userdata-blob"
           ]
         }
       }
@@ -1444,6 +1509,46 @@
           }
         }
       },
+      "metadata": [
+        {
+          "access": "write"
+        }
+      ]
+    },
+    {
+      "unique-id": "bot-userdata",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "bot"
+          },
+          "destination": {
+            "node": "userdata-blob"
+          }
+        }
+      },
+      "description": "restore session before launch (read) + write rotated session back on clean teardown (write)",
+      "protocol": "HTTPS",
+      "metadata": [
+        {
+          "access": "read-write"
+        }
+      ]
+    },
+    {
+      "unique-id": "remote-browser-userdata",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "remote-browser"
+          },
+          "destination": {
+            "node": "userdata-blob"
+          }
+        }
+      },
+      "description": "provisioning login uploads the confirmed signed-in session",
+      "protocol": "HTTPS",
       "metadata": [
         {
           "access": "write"
@@ -1859,6 +1964,22 @@
       "protocol": "HTTPS"
     },
     {
+      "unique-id": "gw-mcp",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "gateway"
+          },
+          "destination": {
+            "node": "mcp",
+            "interface": "mcp-http"
+          }
+        }
+      },
+      "description": "proxy /mcp \u2014 POST buffered, GET relayed unbuffered (SSE stream)",
+      "protocol": "HTTPS"
+    },
+    {
       "unique-id": "gw-admin",
       "relationship-type": {
         "connects": {
@@ -2000,6 +2121,36 @@
       },
       "description": "live WS via gateway",
       "protocol": "WebSocket"
+    },
+    {
+      "unique-id": "dash-gw-rest",
+      "description": "dashboard \u2192 gateway REST (hosted-compat aliases; the hosted-proven wiring)",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "dashboard"
+          },
+          "destination": {
+            "node": "gateway",
+            "interface": "gateway-rest"
+          }
+        }
+      }
+    },
+    {
+      "unique-id": "dash-gw-ws",
+      "description": "dashboard \u2192 gateway /ws (live transcript view)",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "dashboard"
+          },
+          "destination": {
+            "node": "gateway",
+            "interface": "gateway-ws"
+          }
+        }
+      }
     },
     {
       "unique-id": "slim-gw",

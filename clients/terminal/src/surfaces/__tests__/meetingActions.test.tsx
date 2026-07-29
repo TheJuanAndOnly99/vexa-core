@@ -44,8 +44,13 @@ afterEach(() => vi.restoreAllMocks());
 describe("actionsFor — offered action sets per status", () => {
   const ids = (s: string) => actionsFor(row(s)).map((a) => a.id);
 
-  it("idle → Schedule + Send now", () => expect(ids("idle")).toEqual(["schedule", "send"]));
-  it("scheduled → Send now + Cancel", () => expect(ids("scheduled")).toEqual(["send", "cancel"]));
+  it("idle → Schedule + Send now + Delete", () => expect(ids("idle")).toEqual(["schedule", "send", "delete"]));
+  it("scheduled → Send now + Cancel + Delete", () => expect(ids("scheduled")).toEqual(["send", "cancel", "delete"]));
+  it("link-less planned rows → row-id actions only (no native path exists)", () => {
+    const linkless = (s: string) => actionsFor({ ...row(s), native_id: undefined, id: "42" });
+    expect(linkless("idle").map((a) => a.id)).toEqual(["delete"]);
+    expect(linkless("scheduled").map((a) => a.id)).toEqual(["cancel", "delete"]);
+  });
   it("active → Stop only", () => expect(ids("active")).toEqual(["stop"]));
   it("joining/awaiting/needs_help/stopping → Stop only", () => {
     for (const s of ["requested", "joining", "awaiting_admission", "needs_help", "stopping"]) {
@@ -88,20 +93,55 @@ describe("actionsFor — each action fires the correct endpoint+body", () => {
     expect(init.method).toBe("DELETE");
   });
 
-  it("active→Stop reports network failures instead of throwing", async () => {
+  it("active→Stop reports network failures instead of throwing — as user truth, raw on the console", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const onFailure = vi.fn();
     fetchMock.mockRejectedValueOnce(new TypeError("Failed to fetch"));
 
     await expect(actionsFor(row("active")).find((a) => a.id === "stop")!.run(onFailure)).resolves.toBeUndefined();
 
+    // UI channel: the presented truth, never the fetch engine's message.
     expect(onFailure).toHaveBeenCalledWith({
       actionId: "stop",
       actionLabel: "Stop",
       native: NATIVE,
-      message: "Failed to fetch",
+      message: "Couldn't reach the Vexa server — check that the stack is running.",
     });
+    // Operator channel: the raw plumbing stays on the console (P18).
     expect(warn).toHaveBeenCalledWith("meeting action failed", expect.objectContaining({ actionId: "stop", message: "Failed to fetch" }));
+  });
+
+  it("a 404 on Stop yields the HUMAN no-longer-active message + a reconciling re-snapshot — never the raw JSON body (issue #674)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const onFailure = vi.fn();
+    fetchMock.mockResolvedValueOnce({
+      ok: false, status: 404, statusText: "Not Found", url: `/api/bots/google_meet/${NATIVE}`,
+      json: async () => ({ detail: "No active meeting found for this bot in google_meet with ID abc-defg-hij" }),
+    } as unknown as Response);
+
+    await actionsFor(row("active")).find((a) => a.id === "stop")!.run(onFailure);
+
+    const { message } = onFailure.mock.calls[0][0];
+    expect(message).toBe("This meeting is no longer active — refreshing the list.");
+    expect(message).not.toContain("404");
+    expect(message).not.toContain("{");
+    // reconcile: the finally-path re-snapshot was requested so the control self-corrects
+    expect(fetchMock.mock.calls.some((c) => String(c[0]).includes("/api/meetings"))).toBe(true);
+    // the raw upstream detail is preserved on the operator channel
+    expect(warn).toHaveBeenCalledWith("meeting action failed", expect.objectContaining({ message: expect.stringContaining("No active meeting found") }));
+  });
+
+  it("a 409 on Send maps to the human already-has-a-bot line", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const onFailure = vi.fn();
+    fetchMock.mockResolvedValueOnce({
+      ok: false, status: 409, statusText: "Conflict", url: "/api/bots",
+      json: async () => ({ detail: "An active or requested meeting already exists" }),
+    } as unknown as Response);
+
+    await actionsFor(row("idle")).find((a) => a.id === "send")!.run(onFailure);
+
+    expect(onFailure.mock.calls[0][0].message).toBe("That meeting already has a bot.");
   });
 
   it("idle→Schedule PUTs intent:scheduled with an ISO `at`", () => {
@@ -120,5 +160,29 @@ describe("actionsFor — each action fires the correct endpoint+body", () => {
     actionsFor(row("completed")).find((a) => a.id === "resend")!.run();
     const { url } = lastFetch();
     expect(url).toBe("/api/bots");
+  });
+
+  it("planned→Delete DELETEs by ROW id (works link-less)", () => {
+    actionsFor({ ...row("idle"), native_id: undefined, id: "42" }).find((a) => a.id === "delete")!.run();
+    const { url, init } = lastFetch();
+    expect(url).toBe("/api/meetings/42");
+    expect(init.method).toBe("DELETE");
+  });
+
+  it("link-less scheduled→Cancel PATCHes scheduled_at:null by ROW id", () => {
+    actionsFor({ ...row("scheduled"), native_id: undefined, id: "42" }).find((a) => a.id === "cancel")!.run();
+    const { url, init, body } = lastFetch();
+    expect(url).toBe("/api/meetings/42");
+    expect(init.method).toBe("PATCH");
+    expect(body).toEqual({ scheduled_at: null });
+  });
+
+  it("send uses the row's REAL meeting_url when present (zoom/teams need it)", () => {
+    actionsFor({ ...row("scheduled"), platform: "zoom", native_id: "1234567890", meeting_url: "https://us02web.zoom.us/j/1234567890?pwd=x" })
+      .find((a) => a.id === "send")!.run();
+    const { url, body } = lastFetch();
+    expect(url).toBe("/api/bots");
+    expect(body.platform).toBe("zoom");
+    expect(body.meeting_url).toBe("https://us02web.zoom.us/j/1234567890?pwd=x");
   });
 });

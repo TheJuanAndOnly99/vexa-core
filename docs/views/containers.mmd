@@ -29,6 +29,7 @@ flowchart LR
   end
   slim["slim"]
   terminal["terminal"]
+  dashboard["dashboard (deprecated)"]
   meeting_api -->|"write"| segments_table
   bot -->|"HTTPS"| transcription
   meeting_api -->|"JDBC"| postgres
@@ -38,8 +39,11 @@ flowchart LR
   mcp -->|"HTTPS"| gateway
   gateway -->|"HTTPS"| meeting_api
   gateway -->|"HTTPS"| agent_api
+  gateway -->|"HTTPS"| mcp
   gateway -->|"HTTPS"| admin_api
   admin_api -->|"JDBC"| postgres
   terminal -->|"HTTPS"| gateway
   terminal -->|"WebSocket"| gateway
+  dashboard -->|""| gateway
+  dashboard -->|""| gateway
   slim -->|"HTTPS"| gateway

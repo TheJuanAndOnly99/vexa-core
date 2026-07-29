@@ -22,3 +22,10 @@ allowBuilds:
   onnxruntime-node: true
   protobufjs: true
   sharp: true
+# Security floor (GHSA-qx2v-qp2m-jg93): next pins postcss 8.4.31 exactly; postcss 8.5.x is
+# API-compatible. clients/terminal/package.json carries the same floor for its npm lockfile.
+overrides:
+  "postcss@<8.5.10": ">=8.5.10"
+  # Security floor (GHSA-xcpc-8h2w-3j85): crafted-ZIP 4 GB allocation in adm-zip <0.6.0,
+  # reached only in onnxruntime-node's postinstall unpack of its own runtime archive.
+  "adm-zip@<0.6.0": ">=0.6.0"
