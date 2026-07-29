@@ -649,30 +649,6 @@
       ]
     },
     {
-      "unique-id": "execution-targets.v1",
-      "node-type": "contract",
-      "name": "execution-targets.v1",
-      "description": "execution-targets.v1 \u2014 sealed/published contract (deploy)",
-      "metadata": [
-        {
-          "path": "deploy/contracts/execution-targets.v1",
-          "domain": "deploy"
-        }
-      ]
-    },
-    {
-      "unique-id": "config.v1",
-      "node-type": "contract",
-      "name": "config.v1",
-      "description": "config.v1 \u2014 sealed/published contract (deploy): per-service deployment-config declaration (required-explicit / defaulted / capability tri-state + live probes), preflight + gate:config-contract (ADR-0026)",
-      "metadata": [
-        {
-          "path": "deploy/contracts/config.v1",
-          "domain": "deploy"
-        }
-      ]
-    },
-    {
       "unique-id": "slim",
       "node-type": "webclient",
       "name": "slim",
@@ -680,17 +656,6 @@
       "metadata": [
         {
           "path": "clients/slim"
-        }
-      ]
-    },
-    {
-      "unique-id": "extension",
-      "node-type": "webclient",
-      "name": "extension",
-      "description": "extension \u2014 client",
-      "metadata": [
-        {
-          "path": "clients/extension"
         }
       ]
     },
@@ -2202,34 +2167,6 @@
         }
       },
       "protocol": "HTTPS"
-    },
-    {
-      "unique-id": "deploy-composed",
-      "relationship-type": {
-        "composed-of": {
-          "container": "deploy",
-          "nodes": [
-            "execution-targets.v1",
-            "config.v1"
-          ]
-        }
-      }
-    },
-    {
-      "unique-id": "extension-gw",
-      "description": "browser extension client; live WS via gateway",
-      "relationship-type": {
-        "connects": {
-          "source": {
-            "node": "extension"
-          },
-          "destination": {
-            "node": "gateway",
-            "interface": "gateway-ws"
-          }
-        }
-      },
-      "protocol": "WebSocket"
     },
     {
       "unique-id": "stack-deployed",

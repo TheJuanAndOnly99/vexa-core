@@ -9,6 +9,7 @@ system meetings  # capture → transcribe → record; owns the raw transcript
   module capture-codec
   module gmeet-capture
   module gmeet-pipeline
+  module jitsi-capture
   module join
   module mixed-capture-core
   module mixed-pipeline
@@ -34,6 +35,7 @@ system meetings  # capture → transcribe → record; owns the raw transcript
   data-asset bot-commands [writers: meeting-api]
   database segments-table [writers: meeting-api]
   data-asset recording-blob [writers: bot, meeting-api]
+  data-asset userdata-blob [writers: remote-browser, bot]
 
 system agent  # copilot; owns the processed (cleaned) transcript + signals
   service agent-api
@@ -44,6 +46,7 @@ system agent  # copilot; owns the processed (cleaned) transcript + signals
   contract task.v1
   contract tool.v1
   contract unit.v1
+  contract processed-notes.v1
   contract workspace.v1
   service agent-worker
   data-asset out-stream [writers: agent-worker]
@@ -88,6 +91,8 @@ edges:
   terminal -read-> proc-stream
   terminal -read-> out-stream
   bot -write-> recording-blob
+  bot -read-write-> userdata-blob  # restore session before launch (read) + write rotated session back on clean teardown (write)
+  remote-browser -write-> userdata-blob  # provisioning login uploads the confirmed signed-in session
   gateway -read-> recording-blob
   bot -call-> transcription  # audio -> first-party STT via TRANSCRIPTION_SERVICE_URL
   bot -read-> bot-commands  # SUBSCRIBE acts.v1 commands
@@ -108,6 +113,7 @@ edges:
   mcp -req-> gateway  # every MCP tool forwards the caller's X-API-Key to the public REST surface
   gateway -req-> meeting-api  # proxy /bots /transcripts /meetings /recordings
   gateway -req-> agent-api  # proxy /agent/*
+  gateway -req-> mcp  # proxy /mcp — POST buffered, GET relayed unbuffered (SSE stream)
   gateway -req-> admin-api  # POST /internal/validate (authz oracle)
   gateway -read-> bm-status  # WS fan-out
   gateway -read-> u-meetings  # WS auto-subscribe
@@ -116,6 +122,8 @@ edges:
   admin-api -write-> postgres
   terminal -req-> gateway  # all REST via gateway
   terminal -req-> gateway  # live WS via gateway
+  dashboard -req-> gateway  # dashboard → gateway REST (hosted-compat aliases; the hosted-proven wiring)
+  dashboard -req-> gateway  # dashboard → gateway /ws (live transcript view)
   slim -req-> gateway  # Python client; REST via gateway
   bot, agent-worker deployed-in runtime
   gateway, meeting-api, agent-api, admin-api, runtime, redis, postgres, minio, transcription deployed-in deploy
