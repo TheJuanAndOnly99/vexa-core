@@ -10,6 +10,7 @@ leadership over time.
 |-----------------|------|--------------|-------|
 | @DmitriyG228 | Dmitry Grankin | Vexa | dmitry@vexa.ai |
 | @psmulovics | Peter Smulovics | Morgan Stanley | Peter.Smulovics@morganstanley.com |
+| @preetiagarwal26 | Preeti Gupta | Citi | — |
 
 For information about maintainer responsibilities and resources, see the
 [FINOS Maintainers Cheatsheet](https://community.finos.org/docs/finos-maintainers-cheatsheet).
