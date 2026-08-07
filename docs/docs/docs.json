@@ -121,5 +121,10 @@
         ]
       }
     ]
+  },
+  "seo": {
+    "metatags": {
+      "robots": "noindex, nofollow"
+    }
   }
 }
