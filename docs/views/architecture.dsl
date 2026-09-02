@@ -24,6 +24,7 @@ system meetings  # capture → transcribe → record; owns the raw transcript
   contract flagged-issue.v1
   contract invocation.v1
   contract lifecycle.v1
+  contract service-authority.v1
   contract transcript.v1
   contract webhook.v1
   service transcription
@@ -72,6 +73,14 @@ system runtime-system  # workload spawn (bot/agent containers)
   service runtime
 
 system deploy  # deployment + execution-target registry
+  contract execution-targets.v1
+  contract config.v1
+
+system service-authority-system  # optional operator-owned admission and active-service authority; absent in stock OSS and never owns billing policy inside core
+  service service-authority
+
+system system-webhook-system  # optional operator-owned terminal-event consumer; absent in stock OSS and never selected from customer or meeting data
+  service system-webhook
 
 system platform  # shared infra backing the services
   service redis
@@ -103,6 +112,9 @@ edges:
   meeting-api -write-> postgres
   meeting-api -write-> minio
   meeting-api -req-> runtime  # POST /workloads spawn bot
+  meeting-api -req-> admin-api  # GET /internal/calendar-configs discovers secret-gated calendar connections for sync and disconnect cleanup
+  meeting-api -req-> service-authority  # optional signed service-authority.v1 admit/continue decision; unset is explicit OSS allow-all, configured failure is closed
+  meeting-api -req-> system-webhook  # optional signed terminal webhook.v1 delivery to a boot-frozen operator destination; customer webhook SSRF policy remains separate
   agent-api -read-> segments-stream  # XREADGROUP agent_copilot (proactive watcher)
   agent-api -req-> runtime  # POST /workloads spawn agent-worker
   agent-api -read-> out-stream  # SSE relay (/api/chat, /api/meeting/stream)
@@ -111,10 +123,10 @@ edges:
   agent-worker -write-> proc-stream  # XADD cleaned 1:1 notes
   agent-worker -read-> unit-in  # chat path XREADs interactive input
   mcp -req-> gateway  # every MCP tool forwards the caller's X-API-Key to the public REST surface
-  gateway -req-> meeting-api  # proxy /bots /transcripts /meetings /recordings
+  gateway -req-> meeting-api  # proxy /bots /transcripts /meetings /recordings and per-calendar sync
   gateway -req-> agent-api  # proxy /agent/*
   gateway -req-> mcp  # proxy /mcp — POST buffered, GET relayed unbuffered (SSE stream)
-  gateway -req-> admin-api  # POST /internal/validate (authz oracle)
+  gateway -req-> admin-api  # POST /internal/validate (authz oracle) plus user calendar connection CRUD
   gateway -read-> bm-status  # WS fan-out
   gateway -read-> u-meetings  # WS auto-subscribe
   gateway -read-> va-chat  # WS fan-out
