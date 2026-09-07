@@ -17,7 +17,7 @@ dependencies = [
     # fastapi-guard — per-IP rate limiting + auto-IP-ban at the edge (edge_guard.py).
     # Pinned <8.0 so a major bump (which may rename SecurityConfig fields) can't silently
     # break the gateway on a `uv sync --frozen` image rebuild.
-    "fastapi-guard>=7.2,<8.0",
+    "fastapi-guard>=7.2,<9.0",
 ]
 
 [tool.uv]
