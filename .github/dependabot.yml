@@ -1,0 +1,92 @@
+# Weekly dependency update PRs. Production-focused grouping where supported.
+# Docs: https://docs.github.com/en/code-security/dependabot/dependabot-version-updates
+version: 2
+updates:
+  # Root pnpm workspace (pnpm-lock.yaml)
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: UTC
+    open-pull-requests-limit: 10
+    groups:
+      production-npm:
+        dependency-type: production
+      development-npm:
+        dependency-type: development
+
+  # Terminal ships from its own npm lockfile (see clients/terminal/Dockerfile)
+  - package-ecosystem: npm
+    directory: "/clients/terminal"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: UTC
+    open-pull-requests-limit: 5
+    groups:
+      production-npm:
+        dependency-type: production
+      development-npm:
+        dependency-type: development
+
+  - package-ecosystem: npm
+    directory: "/packages/transcript-rendering"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: UTC
+    open-pull-requests-limit: 3
+
+  # Python services (uv.lock). One entry per locked package root.
+  - package-ecosystem: uv
+    directory: "/core/runtime"
+    schedule: { interval: weekly, day: monday, time: "06:00", timezone: UTC }
+  - package-ecosystem: uv
+    directory: "/core/agent"
+    schedule: { interval: weekly, day: monday, time: "06:00", timezone: UTC }
+  - package-ecosystem: uv
+    directory: "/core/agent/services/agent-api"
+    schedule: { interval: weekly, day: monday, time: "06:00", timezone: UTC }
+  - package-ecosystem: uv
+    directory: "/core/flows"
+    schedule: { interval: weekly, day: monday, time: "06:00", timezone: UTC }
+  - package-ecosystem: uv
+    directory: "/core/gateway/services/gateway"
+    schedule: { interval: weekly, day: monday, time: "06:00", timezone: UTC }
+  - package-ecosystem: uv
+    directory: "/core/gateway/services/conformance"
+    schedule: { interval: weekly, day: monday, time: "06:00", timezone: UTC }
+  - package-ecosystem: uv
+    directory: "/core/identity"
+    schedule: { interval: weekly, day: monday, time: "06:00", timezone: UTC }
+  - package-ecosystem: uv
+    directory: "/core/identity/services/admin-api"
+    schedule: { interval: weekly, day: monday, time: "06:00", timezone: UTC }
+  - package-ecosystem: uv
+    directory: "/core/meetings/services/meeting-api"
+    schedule: { interval: weekly, day: monday, time: "06:00", timezone: UTC }
+  - package-ecosystem: uv
+    directory: "/core/meetings/services/mcp"
+    schedule: { interval: weekly, day: monday, time: "06:00", timezone: UTC }
+  - package-ecosystem: uv
+    directory: "/core/meetings/services/transcription"
+    schedule: { interval: weekly, day: monday, time: "06:00", timezone: UTC }
+  - package-ecosystem: uv
+    directory: "/core/seam/meeting-status-ws"
+    schedule: { interval: weekly, day: monday, time: "06:00", timezone: UTC }
+  - package-ecosystem: uv
+    directory: "/clients/slim"
+    schedule: { interval: weekly, day: monday, time: "06:00", timezone: UTC }
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: UTC
+    open-pull-requests-limit: 5

@@ -5,6 +5,8 @@ dist/
 __pycache__/
 *.egg-info/
 .pytest_cache/
+.corepack-cache/
+.pnpm-store/
 *.log
 .DS_Store
 .env
