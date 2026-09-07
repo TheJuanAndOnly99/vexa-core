@@ -39,7 +39,7 @@
     "access": "public"
   },
   "devDependencies": {
-    "@types/node": "20.19.37",
+    "@types/node": "26.4.1",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3",
     "vitest": "^4.1.7"
