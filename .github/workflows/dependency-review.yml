@@ -1,6 +1,7 @@
-# PR gate: block newly introduced runtime vulns and FINOS Category-X licenses
+# PR gate: block newly introduced runtime vulns and non-allowed licenses
 # in dependency diffs (npm / GitHub dependency graph).
 # Requires: Settings → Code security → Dependency graph (enabled).
+
 name: Dependency Review
 
 on:
@@ -21,24 +22,31 @@ jobs:
         uses: actions/dependency-review-action@v4
         with:
           fail-on-severity: high
-          # Match project preference: ignore pure-dev dependency noise
           fail-on-scopes: runtime
-          # FINOS Category X (subset of SPDX ids commonly seen on npm/PyPI)
-          deny-licenses: >-
-            AGPL-1.0-only,
-            AGPL-1.0-or-later,
-            AGPL-3.0-only,
-            AGPL-3.0-or-later,
-            GPL-2.0-only,
-            GPL-2.0-or-later,
-            GPL-3.0-only,
-            GPL-3.0-or-later,
-            LGPL-2.0-only,
-            LGPL-2.0-or-later,
-            LGPL-2.1-only,
-            LGPL-2.1-or-later,
-            LGPL-3.0-only,
-            LGPL-3.0-or-later,
-            SSPL-1.0,
-            BUSL-1.1
+          # FINOS Category A (+ common SPDX spellings) and Category B (MPL/EPL/CDDL/OFL).
+          # Mutually exclusive with deny-licenses.
+          allow-licenses: >-
+            0BSD,
+            Apache-2.0,
+            BlueOak-1.0.0,
+            BSD-2-Clause,
+            BSD-3-Clause,
+            BSD-3-Clause-Clear,
+            CC0-1.0,
+            CDDL-1.0,
+            CDDL-1.1,
+            EPL-1.0,
+            EPL-2.0,
+            ISC,
+            MIT,
+            MIT-0,
+            MPL-1.1,
+            MPL-2.0,
+            OFL-1.1,
+            Python-2.0,
+            Unlicense,
+            WTFPL,
+            Zlib
+          # Known transitive exceptions reviewed separately.
+          allow-dependencies-licenses: pkg:npm/caniuse-lite
           comment-summary-in-pr: on-failure
