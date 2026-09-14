@@ -23,7 +23,7 @@
     "@vexa/transcribe-buffer": "workspace:*",
     "@vexa/transcribe-whisper": "workspace:*",
     "@huggingface/transformers": "^4.2.0",
-    "onnxruntime-node": "^1.17.0"
+    "onnxruntime-node": "^1.29.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
