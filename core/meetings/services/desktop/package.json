@@ -17,7 +17,7 @@
     "@vexa/mixed-pipeline": "workspace:*",
     "@vexa/recording": "workspace:*",
     "@vexa/transcribe-whisper": "workspace:*",
-    "ws": "^8.21.0"
+    "ws": "^8.21.3"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
