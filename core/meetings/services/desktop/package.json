@@ -17,11 +17,11 @@
     "@vexa/mixed-pipeline": "workspace:*",
     "@vexa/recording": "workspace:*",
     "@vexa/transcribe-whisper": "workspace:*",
-    "ws": "^8.21.0"
+    "ws": "^8.22.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
-    "@types/ws": "^8.5.0",
+    "@types/ws": "^8.18.2",
     "ajv": "^8.17.0",
     "ajv-formats": "^3.0.1",
     "tsx": "^4.19.0",
