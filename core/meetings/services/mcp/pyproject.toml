@@ -18,7 +18,7 @@ dependencies = [
     "pydantic>=2,<3",
     # Test harness (in-process, no network — the tests inject an httpx.MockTransport gateway).
     "pytest>=8",
-    "pytest-asyncio>=0.23,<2",
+    "pytest-asyncio>=1.4.1,<2",
 ]
 
 [tool.uv]
